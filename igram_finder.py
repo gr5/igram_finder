@@ -32,6 +32,7 @@ Options:
     --threshold N  Brightness threshold for outer-envelope detection (default: 20)
     --scale N      Downsample factor — 4 means work at 1/4 resolution (default: 4)
     --jump-warn N  Warn if circle center moves > N px between frames (default: 50)
+    --re-look      Second pass: use session consensus to re-anchor outlier detections
 """
 
 import argparse
@@ -43,6 +44,21 @@ from typing import Optional
 import cv2
 import numpy as np
 from scipy.ndimage import uniform_filter
+
+
+# ---------------------------------------------------------------------------
+# Tuneable constants
+# ---------------------------------------------------------------------------
+
+# Fringe visibility score below which an image is flagged as "low-fringe"
+# (near-zero tilt).  These images are not suitable for DFTFringe processing.
+LOW_FRINGE_SCORE: float = 0.10
+
+# Re-look second pass: re-anchor an outlier only when its centre differs
+# from session consensus by at least _RELOOK_MIN_PX (otherwise it's already
+# close) and at most _RELOOK_MAX_PX (otherwise the mirror may have moved).
+_RELOOK_MIN_PX: float = 20.0
+_RELOOK_MAX_PX: float = 80.0
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +206,7 @@ def detect_mirror(
     threshold: int = 20,
     prev_circle: Optional[tuple[float, float, float]] = None,
     jump_warn: float = 50.0,
-) -> Optional[tuple[float, float, float]]:
+) -> Optional[tuple[float, float, float, float]]:
     """
     Detect the mirror aperture circle in an interferogram image.
 
@@ -202,7 +218,10 @@ def detect_mirror(
     The outer envelope provides a spatial bound; RANSAC on the fringe-region
     contour finds the mirror circle even when fringe brightness is uneven.
 
-    Returns (center_x, center_y, radius) in full-image pixels, or None.
+    Returns (center_x, center_y, radius, fringe_score) in full-image pixels,
+    or None.  fringe_score is a normalised measure of fringe visibility;
+    values below LOW_FRINGE_SCORE indicate a near-zero-tilt (low-fringe)
+    image that is not suitable for DFTFringe processing.
     """
     img_bgr = cv2.imread(str(image_path))
     if img_bgr is None:
@@ -246,6 +265,16 @@ def detect_mirror(
     sf = small.astype(np.float32)
     mean_f = uniform_filter(sf, 21)
     var_map = np.clip(uniform_filter(sf ** 2, 21) - mean_f ** 2, 0, None)
+
+    # Fringe visibility score: normalised high-spatial-frequency variance
+    # inside the envelope.  A 5×5 filter captures fringe texture (higher
+    # frequency than the 21×21 filter) without slow brightness gradients.
+    # Low score → few fringes → near-zero tilt image.
+    _sf5 = uniform_filter(sf, 5)
+    _var5 = np.clip(uniform_filter(sf ** 2, 5) - _sf5 ** 2, 0, None)
+    _env_pixels = sf[envelope_mask > 0]
+    _env_mean = float(_env_pixels.mean()) + 1e-6
+    fringe_score = float(np.sqrt(_var5[envelope_mask > 0]).mean()) / _env_mean
 
     def _fringe_ransac(mask: np.ndarray) -> Optional[tuple[float, float, float]]:
         """
@@ -368,7 +397,7 @@ def detect_mirror(
                 f"center moved {dist:.1f}px, radius Δ{r_diff:.1f}px"
             )
 
-    return cx, cy, radius
+    return cx, cy, radius, fringe_score
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +444,93 @@ def write_oln(
 
 
 # ---------------------------------------------------------------------------
+# Second-pass re-look
+# ---------------------------------------------------------------------------
+
+def _second_pass(
+    results: list[tuple],
+    scale: int,
+    dry_run: bool,
+) -> list[tuple]:
+    """
+    Use session consensus from high-fringe images to re-anchor outlier
+    detections.
+
+    For each high-fringe image whose centre differs from the session median
+    by 20–80 px, re-run Stage 4 (radial gradient refinement) anchored on
+    the consensus circle.  Accept the new result only if it reduces the
+    combined distance from consensus by ≥ 10 %.  Images outside the 20–80 px
+    window are either already correct (< 20) or the mirror has genuinely
+    moved (> 80) and must not be overridden.
+
+    `results` is a list of (img_path, cx, cy, radius, fringe_score) tuples
+    in full-resolution pixels.  Returns an updated list with the same
+    structure; .oln files are rewritten for any accepted re-looks (unless
+    dry_run is True).
+    """
+    high_fringe = [
+        (cx, cy, r)
+        for _, cx, cy, r, fs in results
+        if fs >= LOW_FRINGE_SCORE
+    ]
+    if len(high_fringe) < 3:
+        return results  # not enough data for a reliable consensus
+
+    cx_c = float(np.median([c[0] for c in high_fringe]))
+    cy_c = float(np.median([c[1] for c in high_fringe]))
+    r_c  = float(np.median([c[2] for c in high_fringe]))
+
+    updated = []
+    for img_path, cx, cy, r, fs in results:
+        if fs < LOW_FRINGE_SCORE:
+            updated.append((img_path, cx, cy, r, fs))
+            continue
+
+        d_old = float(np.hypot(cx - cx_c, cy - cy_c))
+        dr_old = abs(r - r_c)
+
+        if d_old < _RELOOK_MIN_PX or d_old > _RELOOK_MAX_PX:
+            # Too close (already good) or too far (mirror repositioned)
+            updated.append((img_path, cx, cy, r, fs))
+            continue
+
+        # Reload image and re-run Stage 4 from consensus seed
+        img_bgr = cv2.imread(str(img_path))
+        if img_bgr is None:
+            updated.append((img_path, cx, cy, r, fs))
+            continue
+        img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        h, w = img_gray.shape
+        small = cv2.resize(img_gray, (w // scale, h // scale),
+                           interpolation=cv2.INTER_AREA)
+
+        new_cx_s, new_cy_s, new_r_s = refine_by_radial_gradient(
+            small, cx_c / scale, cy_c / scale, r_c / scale
+        )
+        new_cx = new_cx_s * scale
+        new_cy = new_cy_s * scale
+        new_r  = new_r_s  * scale
+
+        d_new  = float(np.hypot(new_cx - cx_c, new_cy - cy_c))
+        dr_new = abs(new_r - r_c)
+
+        if (d_new + dr_new) < (d_old + dr_old) * 0.9:
+            tag = " [dry-run]" if dry_run else ""
+            print(
+                f"    [re-look] {img_path.name}:"
+                f" cx={cx:.1f} cy={cy:.1f} r={r:.1f}"
+                f" → cx={new_cx:.1f} cy={new_cy:.1f} r={new_r:.1f}{tag}"
+            )
+            if not dry_run:
+                write_oln(img_path.with_suffix(".oln"), new_cx, new_cy, new_r)
+            updated.append((img_path, new_cx, new_cy, new_r, fs))
+        else:
+            updated.append((img_path, cx, cy, r, fs))
+
+    return updated
+
+
+# ---------------------------------------------------------------------------
 # Directory processing
 # ---------------------------------------------------------------------------
 
@@ -426,6 +542,7 @@ def process_directory(
     scale: int = 4,
     threshold: int = 20,
     jump_warn: float = 50.0,
+    re_look: bool = False,
 ) -> None:
     """
     Process all JPEG images in `directory`.
@@ -453,6 +570,7 @@ def process_directory(
 
     prev_circle: Optional[tuple[float, float, float]] = None
     processed = skipped = failed = 0
+    all_results: list[tuple] = []  # (img_path, cx, cy, radius, fringe_score)
 
     for img_path in images:
         oln_path = img_path.with_suffix(".oln")
@@ -480,7 +598,8 @@ def process_directory(
             failed += 1
             continue
 
-        cx, cy, radius = result
+        cx, cy, radius, fringe_score = result
+        fringe_tag = " [low-fringe]" if fringe_score < LOW_FRINGE_SCORE else ""
 
         if compare:
             existing = load_oln_circle(oln_path)
@@ -489,24 +608,29 @@ def process_directory(
                 d_center = np.hypot(cx - ex, cy - ey)
                 d_radius = abs(radius - er)
                 print(
-                    f" cx={cx:.1f} cy={cy:.1f} r={radius:.1f} | "
+                    f" cx={cx:.1f} cy={cy:.1f} r={radius:.1f}  fringe={fringe_score:.2f} | "
                     f"existing cx={ex:.1f} cy={ey:.1f} r={er:.1f} | "
-                    f"Δcenter={d_center:.1f}px Δr={d_radius:.1f}px"
+                    f"Δcenter={d_center:.1f}px Δr={d_radius:.1f}px{fringe_tag}"
                 )
             else:
-                print(f" cx={cx:.1f} cy={cy:.1f} r={radius:.1f}")
-            prev_circle = result
+                print(f" cx={cx:.1f} cy={cy:.1f} r={radius:.1f}  fringe={fringe_score:.2f}{fringe_tag}")
+            prev_circle = (cx, cy, radius)
             processed += 1
             continue
 
         tag = " [dry-run]" if dry_run else ""
-        print(f" cx={cx:.1f} cy={cy:.1f} r={radius:.1f}{tag}")
+        print(f" cx={cx:.1f} cy={cy:.1f} r={radius:.1f}  fringe={fringe_score:.2f}{fringe_tag}{tag}")
 
         if not dry_run:
             write_oln(oln_path, cx, cy, radius)
 
-        prev_circle = result
+        prev_circle = (cx, cy, radius)
+        all_results.append((img_path, cx, cy, radius, fringe_score))
         processed += 1
+
+    if re_look and all_results:
+        print("\n--- Re-look (second pass) ---")
+        _second_pass(all_results, scale=scale, dry_run=dry_run)
 
     if compare:
         print(f"\nCompared: {processed} image(s), {failed} failed")
@@ -568,6 +692,14 @@ def main() -> None:
         metavar="N",
         help="Warn if circle moves > N pixels between frames (default: 50)",
     )
+    parser.add_argument(
+        "--re-look",
+        action="store_true",
+        help=(
+            "Second pass: use session consensus from high-fringe images to "
+            "re-anchor detections that differ from consensus by 20–80 px"
+        ),
+    )
     args = parser.parse_args()
 
     directory = Path(args.directory)
@@ -583,6 +715,7 @@ def main() -> None:
         scale=args.scale,
         threshold=args.threshold,
         jump_warn=args.jump_warn,
+        re_look=args.re_look,
     )
 
 

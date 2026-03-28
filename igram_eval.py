@@ -37,7 +37,7 @@ import numpy as np
 
 # Reuse detection and I/O from igram_finder
 sys.path.insert(0, str(Path(__file__).parent))
-from igram_finder import detect_mirror, load_oln_circle
+from igram_finder import detect_mirror, load_oln_circle, LOW_FRINGE_SCORE
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +75,7 @@ class ImageResult:
     d_center: Optional[float] = None
     d_radius: Optional[float] = None
     sat_frac: Optional[float] = None   # saturation fraction (if checked)
+    fringe_score: Optional[float] = None
 
 
 @dataclass
@@ -204,7 +205,7 @@ def eval_directory(
                 print(f"    {img_path.name}  FAIL{overexp_tag}")
             continue
 
-        cx, cy, r = detected
+        cx, cy, r, fringe_score = detected
         d_center = float(np.hypot(cx - gt[0], cy - gt[1])) if gt else None
         d_radius = float(abs(r - gt[2])) if gt else None
         status = "OVEREXP" if is_overexp else "OK"
@@ -212,17 +213,19 @@ def eval_directory(
         res = ImageResult(
             path=img_path,
             status=status,
-            detected=detected,
+            detected=(cx, cy, r),
             ground_truth=gt,
             d_center=d_center,
             d_radius=d_radius,
             sat_frac=sat if is_overexp else None,
+            fringe_score=fringe_score,
         )
         stats.results.append(res)
-        prev_circle = detected
+        prev_circle = (cx, cy, r)
 
         if verbose:
             overexp_tag = f"  [sat={sat:.1%}]" if is_overexp else ""
+            low_fringe_tag = "  [low-fringe]" if fringe_score < LOW_FRINGE_SCORE else ""
             gt_str = (f"  gt cx={gt[0]:.1f} cy={gt[1]:.1f} r={gt[2]:.1f}" if gt else "")
             d_str = (
                 f"  Δcenter={d_center:.1f}px  Δr={d_radius:.1f}px"
@@ -231,7 +234,8 @@ def eval_directory(
             print(
                 f"    {img_path.name}  {status:<7}"
                 f"  cx={cx:.1f} cy={cy:.1f} r={r:.1f}"
-                f"{gt_str}{d_str}{overexp_tag}"
+                f"  fringe={fringe_score:.2f}"
+                f"{gt_str}{d_str}{overexp_tag}{low_fringe_tag}"
             )
 
     return stats

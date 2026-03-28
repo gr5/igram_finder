@@ -57,13 +57,17 @@ JPEG  →  grayscale  →  ¼-scale
          │
          ├── Stage 2: local variance map → fringe-region binary mask
          │              (+ outer-ring fallback if Stage 3 grabs the envelope)
+         │              + fringe_score (5×5 variance / mean brightness)
          │
          ├── Stage 3: RANSAC circle fit on fringe-region contour
          │
          ├── Stage 4: radial gradient refinement
          │              (+ prev-circle fallback if radius jumps > 10 %)
          │
-         └── result (cx, cy, radius) in full-resolution pixels → .oln
+         ├── result (cx, cy, radius, fringe_score) → .oln
+         │
+         └── optional second pass (--re-look):
+                session consensus → re-anchor outliers (20–80 px window)
 ```
 
 ---
@@ -257,6 +261,83 @@ mean radius error < 2 full-resolution pixels on all tested datasets.
 is wide enough to accommodate the Stage 3 over-estimate (~10–20 small-scale px)
 with margin, but narrow enough to avoid the next fringe ring or the envelope
 boundary.
+
+---
+
+## Fringe visibility score
+
+Computed alongside the variance map using a 5 × 5 uniform filter (faster
+spatial frequency than the 21 × 21 detection filter):
+
+```
+sf5   = uniform_filter(I,   5)
+var5  = uniform_filter(I²,  5) − sf5²
+fringe_score = mean(sqrt(var5)  inside envelope)
+             / mean(I           inside envelope)
+```
+
+The score is a dimensionless ratio.  Typical values:
+
+| Image type | fringe_score |
+|---|---|
+| High-fringe (many tight bands) | 0.30 – 0.45 |
+| Normal (6–12 fringes) | 0.18 – 0.32 |
+| Low-tilt (1–3 fringes) | 0.11 – 0.14 |
+| Near-zero tilt (0–1 fringes) | 0.10 – 0.13 |
+
+Because low-tilt and normal-low-contrast images overlap around 0.11–0.13,
+a fixed global threshold cannot reliably classify individual images.  The
+score is therefore reported in the output but not used to gate detection —
+detection is always attempted.  `LOW_FRINGE_SCORE = 0.10` is a conservative
+floor that flags only the most extreme cases.
+
+The score is used by the re-look second pass to identify which images are
+reliable enough to contribute to the session consensus.
+
+---
+
+## Re-look second pass (optional, `--re-look`)
+
+**Problem:** In a directory that spans multiple rotations (or occasionally a
+badly-failed first-pass image), a minority of detections may land 20–80 px
+from the true position.  If the true mirror position is stable for the
+majority of frames, the session consensus can be used to re-anchor these
+outliers.
+
+**Algorithm:**
+
+1. **Identify high-fringe images:** those with `fringe_score ≥ LOW_FRINGE_SCORE`
+   (0.10).  These are reliable enough to contribute to consensus.
+
+2. **Compute session consensus:** median `(cx, cy, radius)` across all
+   high-fringe detections.  The median is robust to the 10–20 % of frames
+   that are typically low-fringe or wrong.
+
+3. **For each high-fringe image:**
+
+   a. Compute `d = |detected_center − consensus_center|` (pixels).
+
+   b. If `d < _RELOOK_MIN_PX` (20 px): already close; skip.
+
+   c. If `d > _RELOOK_MAX_PX` (80 px): mirror has genuinely moved (e.g. new
+      rotation group); skip — never force a cross-group fit.
+
+   d. Otherwise: reload the image, run Stage 4 (`refine_by_radial_gradient`)
+      anchored on the consensus circle.
+
+   e. Accept the re-look result if `(d_new + Δr_new) < (d_old + Δr_old) × 0.9`
+      (reduces combined distance + radius error by ≥ 10 %).  Overwrite the
+      `.oln` file (unless `--dry-run`).
+
+**Safety bounds:** The 80 px cap prevents forcing a consensus from one
+rotation group onto a genuinely repositioned group.  In the tested datasets
+(AT8IN 2024-08-18, two groups ~87 px apart) all group-2 images cleared the
+80 px limit and were correctly left alone.
+
+**Typical result:** Low-fringe outliers that drifted 20–40 px from the true
+position are corrected.  Near-zero-tilt images are also in this range but
+Stage 4 may not converge from the consensus seed if the mirror edge has no
+brightness gradient; those re-looks are rejected by the 10 % criterion.
 
 ---
 
