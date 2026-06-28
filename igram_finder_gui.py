@@ -28,9 +28,11 @@ from PIL import Image, ImageTk
 
 from igram_finder import (
     LOW_FRINGE_SCORE,
+    SPOT_THRESHOLD,
     _second_pass,
     detect_mirror,
     load_oln_circle,
+    load_oln_regions,
     write_oln,
 )
 
@@ -151,7 +153,8 @@ class IgramFinderGUI:
         self.root.title("igram_finder")
         self.root.minsize(1000, 650)
 
-        # per-image state: str(path) -> dict(status, cx, cy, radius, fringe_score)
+        # per-image state: str(path) -> dict(status, cx, cy, radius,
+        #                                     fringe_score, regions)
         self._results: dict[str, dict] = {}
         self._image_paths: list[Path] = []   # ordered for listbox index alignment
         self._directories: list[Path] = []
@@ -227,12 +230,14 @@ class IgramFinderGUI:
         self._dryrun_var  = tk.BooleanVar()
         self._compare_var = tk.BooleanVar()
         self._relook_var  = tk.BooleanVar()
+        self._nospots_var = tk.BooleanVar()
 
         for text, var in [
             ("--force  (overwrite existing .oln)", self._force_var),
             ("--dry-run  (detect, no files written)", self._dryrun_var),
             ("--compare  (test vs existing .oln)", self._compare_var),
             ("--re-look  (second-pass consensus)", self._relook_var),
+            ("--no-spots  (disable reflection detection)", self._nospots_var),
         ]:
             ttk.Checkbutton(parent, text=text, variable=var).grid(
                 row=row, column=0, sticky="w"); row += 1
@@ -244,11 +249,13 @@ class IgramFinderGUI:
         self._threshold_var = tk.IntVar(value=20)
         self._scale_var     = tk.IntVar(value=4)
         self._jumpwarn_var  = tk.DoubleVar(value=50.0)
+        self._spotthresh_var = tk.DoubleVar(value=SPOT_THRESHOLD)
 
         for r, label, var, lo, hi, inc in [
             (0, "Threshold (0-255):", self._threshold_var, 0,   255, 1),
             (1, "Scale:",             self._scale_var,     1,    16, 1),
             (2, "Jump-warn (px):",    self._jumpwarn_var,  0,   500, 10),
+            (3, "Spot-threshold:",    self._spotthresh_var, 0.0, 2.0, 0.05),
         ]:
             ttk.Label(nf, text=label).grid(row=r, column=0, sticky="w")
             ttk.Spinbox(nf, from_=lo, to=hi, increment=inc,
@@ -396,6 +403,7 @@ class IgramFinderGUI:
                     "status": "pending",
                     "cx": None, "cy": None,
                     "radius": None, "fringe_score": None,
+                    "regions": None,
                 })
         self._log(f"Added {len(images)} image(s) from {d.name}")
         self._rebuild_img_listbox()
@@ -449,9 +457,11 @@ class IgramFinderGUI:
         dry_run    = self._dryrun_var.get()
         compare    = self._compare_var.get()
         re_look    = self._relook_var.get()
+        find_spots = not self._nospots_var.get()
         scale      = self._scale_var.get()
         threshold  = self._threshold_var.get()
         jump_warn  = self._jumpwarn_var.get()
+        spot_thresh = self._spotthresh_var.get()
 
         q_stream  = _QueueStream(self._work_queue)
         old_stdout = sys.stdout
@@ -469,6 +479,7 @@ class IgramFinderGUI:
                     images = [p for p in images if p.with_suffix(".oln").exists()]
 
                 prev_circle: Optional[tuple[float, float, float]] = None
+                prev_spots: list = []
                 all_results: list[tuple] = []
 
                 for img_path in images:
@@ -481,11 +492,12 @@ class IgramFinderGUI:
                     # skip if .oln exists and not force/compare
                     if oln_path.exists() and not force and not compare:
                         existing = load_oln_circle(oln_path)
+                        prev_spots = load_oln_regions(oln_path)
                         if existing:
                             cx, cy, r = existing
                             prev_circle = existing
                             self._work_queue.put(
-                                ("result", (img_path, cx, cy, r, None, "skipped")))
+                                ("result", (img_path, cx, cy, r, None, prev_spots, "skipped")))
                         else:
                             self._work_queue.put(("status", (img_path, "skipped")))
                         print(f"  {img_path.name}: skipped (already has .oln)")
@@ -498,6 +510,9 @@ class IgramFinderGUI:
                         threshold=threshold,
                         prev_circle=prev_circle,
                         jump_warn=jump_warn,
+                        find_spots=find_spots,
+                        spot_threshold=spot_thresh,
+                        prev_spots=prev_spots,
                     )
 
                     if result is None:
@@ -505,30 +520,33 @@ class IgramFinderGUI:
                         self._work_queue.put(("status", (img_path, "failed")))
                         continue
 
-                    cx, cy, radius, fringe_score = result
+                    cx, cy, radius, fringe_score, regions = result
                     status = "low-fringe" if fringe_score < LOW_FRINGE_SCORE else "ok"
                     fringe_tag = " [low-fringe]" if status == "low-fringe" else ""
+                    spot_tag = f" [{len(regions)} spot(s)]" if regions else ""
                     tag = " [dry-run]" if dry_run else ""
                     print(
                         f" cx={cx:.1f} cy={cy:.1f} r={radius:.1f}"
-                        f"  fringe={fringe_score:.2f}{fringe_tag}{tag}"
+                        f"  fringe={fringe_score:.2f}{fringe_tag}{spot_tag}{tag}"
                     )
 
                     if not dry_run and not compare:
-                        write_oln(oln_path, cx, cy, radius)
+                        write_oln(oln_path, cx, cy, radius, regions)
 
                     prev_circle = (cx, cy, radius)
-                    all_results.append((img_path, cx, cy, radius, fringe_score))
+                    prev_spots = regions
+                    all_results.append(
+                        (img_path, cx, cy, radius, fringe_score, regions))
                     self._work_queue.put(
-                        ("result", (img_path, cx, cy, radius, fringe_score, status)))
+                        ("result", (img_path, cx, cy, radius, fringe_score, regions, status)))
 
                 if re_look and all_results and not self._cancel_flag.is_set():
                     print("\n─── Re-look (second pass) ───")
                     updated = _second_pass(all_results, scale=scale, dry_run=dry_run)
-                    for img_path, cx, cy, r, fs in updated:
+                    for img_path, cx, cy, r, fs, regions in updated:
                         st = "low-fringe" if fs < LOW_FRINGE_SCORE else "ok"
                         self._work_queue.put(
-                            ("result", (img_path, cx, cy, r, fs, st)))
+                            ("result", (img_path, cx, cy, r, fs, regions, st)))
 
         finally:
             sys.stdout = old_stdout
@@ -546,12 +564,13 @@ class IgramFinderGUI:
                     self._results[str(img_path)]["status"] = status
                     self._update_img_entry(img_path)
                 elif kind == "result":
-                    img_path, cx, cy, radius, fringe_score, status = data
+                    img_path, cx, cy, radius, fringe_score, regions, status = data
                     self._results[str(img_path)].update({
                         "status": status,
                         "cx": cx, "cy": cy,
                         "radius": radius,
                         "fringe_score": fringe_score,
+                        "regions": regions,
                     })
                     self._update_img_entry(img_path)
                     # refresh preview if this is the currently displayed image
@@ -585,10 +604,12 @@ class IgramFinderGUI:
         info = self._results.get(str(img_path), {})
         cx, cy, r = info.get("cx"), info.get("cy"), info.get("radius")
         fs = info.get("fringe_score")
+        regions = info.get("regions")
         if cx is not None:
             fs_str = f"  fringe={fs:.3f}" if fs is not None else ""
+            spot_str = f"  spots={len(regions)}" if regions else ""
             self._img_status_var.set(
-                f"cx={cx:.1f}  cy={cy:.1f}  r={r:.1f}{fs_str}")
+                f"cx={cx:.1f}  cy={cy:.1f}  r={r:.1f}{fs_str}{spot_str}")
         else:
             self._img_status_var.set(info.get("status", "pending"))
 
@@ -605,9 +626,10 @@ class IgramFinderGUI:
         cx     = info.get("cx")
         cy     = info.get("cy")
         radius = info.get("radius")
+        regions = info.get("regions")
 
         if cx is not None and cy is not None and radius is not None:
-            self._crop_bgr = self._make_crop(img_bgr, cx, cy, radius)
+            self._crop_bgr = self._make_crop(img_bgr, cx, cy, radius, regions)
         else:
             # No detection yet — show the full image thumbnail
             h, w = img_bgr.shape[:2]
@@ -620,8 +642,10 @@ class IgramFinderGUI:
 
     @staticmethod
     def _make_crop(img_bgr: np.ndarray,
-                   cx: float, cy: float, radius: float) -> np.ndarray:
-        """Draw circle on a copy and crop to circle region + 10 % margin."""
+                   cx: float, cy: float, radius: float,
+                   regions: Optional[list] = None) -> np.ndarray:
+        """Draw circle (and any spot regions) on a copy and crop to circle
+        region + 10 % margin."""
         out = img_bgr.copy()
         cv2.circle(out, (int(cx), int(cy)), int(radius), (0, 220, 0), 3)
         # small crosshair at centre
@@ -630,6 +654,13 @@ class IgramFinderGUI:
                  (0, 220, 0), 2)
         cv2.line(out, (int(cx), int(cy) - arm), (int(cx), int(cy) + arm),
                  (0, 220, 0), 2)
+
+        # bright internal-reflection spot regions, drawn in red
+        for poly in regions or []:
+            pts = np.array([[p["x"], p["y"]] for p in poly], dtype=np.int32)
+            if len(pts) >= 2:
+                cv2.polylines(out, [pts], isClosed=True, color=(0, 0, 255),
+                              thickness=3)
 
         margin = radius * 0.10
         h, w = out.shape[:2]

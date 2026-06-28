@@ -36,10 +36,11 @@ The script was entirely "vibe-coded" using Claude Code and many instructions by 
 
 ## Scripts
 
-| Script            | Purpose |
-|-------------------|---------|
-| `igram_finder.py` | Detect mirror aperture and write `.oln` files for a directory of JPEGs |
-| `igram_eval.py`   | Walk a directory tree, compare detections against hand-placed ground-truth `.oln` files, and report accuracy |
+| Script                 | Purpose |
+|------------------------|---------|
+| `igram_finder.py`      | Detect mirror aperture and write `.oln` files for a directory of JPEGs |
+| `igram_finder_gui.py`  | Tkinter GUI wrapper — add directories, set options, run the detector, and preview results interactively |
+| `igram_eval.py`        | Walk a directory tree, compare detections against hand-placed ground-truth `.oln` files, and report accuracy |
 
 ---
 
@@ -49,13 +50,14 @@ The script was entirely "vibe-coded" using Claude Code and many instructions by 
 - [OpenCV](https://pypi.org/project/opencv-python/) (`cv2`)
 - [NumPy](https://numpy.org/)
 - [SciPy](https://scipy.org/) (for `scipy.ndimage.uniform_filter`)
+- [Pillow](https://python-pillow.org/) (`PIL` / `ImageTk`) — GUI only
 
 ---
 
 ## Setup: creating a virtual environment
 
 ```bash
-# 1. Create the venv (once)
+# 1. Create the venv (once) (Note - you can name your venv anything; here it's `.venv`)
 python3 -m venv .venv
 
 # 2. Activate it
@@ -65,7 +67,7 @@ source .venv/bin/activate
 .venv\Scripts\Activate.ps1
 
 # 3. Install dependencies
-pip install opencv-python numpy scipy
+pip install opencv-python numpy scipy pillow
 ```
 
 To leave the venv when you're done:
@@ -88,6 +90,33 @@ To recreate the environment elsewhere:
 pip install -r requirements.txt
 ```
 
+This is not recommended for normal users, as there can be version conflicts. Just install the
+dependencies listed above and you should be good.
+
+---
+
+## GUI
+
+`igram_finder_gui.py` provides a point-and-click interface to the detector.
+Launch it with:
+
+```bash
+./run_gui.sh
+```
+Note: you must be in the directory where the igram finder scripts are.
+
+Or manually:
+
+```bash
+source .venv/bin/activate
+python igram_finder_gui.py
+```
+
+The left panel lets you add/remove directories, set all detection options, and
+start or cancel a run.  The right panel lists every image with a status symbol
+(`[✓]` ok, `[~]` low-fringe, `[!]` failed, `[S]` skipped) — click any entry
+to see a cropped preview of the detected circle.
+
 ---
 
 ## Usage
@@ -104,15 +133,17 @@ python igram_finder.py <directory>
 
 Common options:
 
-| Option          | Default | Description |
-|-----------------|-----|-----------------|
-| `--force`       | off | Overwrite existing `.oln` files |
-| `--dry-run`     | off | Detect and print results without writing |
-| `--compare`     | off | Compare against existing `.oln` files (for testing) |
-| `--re-look`     | off | Second pass: use session consensus to fix outlier detections |
-| `--scale N`     | 4   | Downsample factor (4 = quarter resolution) |
-| `--threshold N` | 20  | Brightness threshold for outer-envelope detection (0–255) |
-| `--jump-warn N` | 50  | Warn if circle centre moves > N px between frames |
+| Option          | Default | Description     |
+|-----------------|---------|-----------------|
+| `--force`       |   off   | Overwrite existing `.oln` files |
+| `--dry-run`     |   off   | Detect and print results without writing |
+| `--compare`     |   off   | Compare against existing `.oln` files (for testing) |
+| `--re-look`     |   off   | Second pass: use session consensus to fix outlier detections |
+| `--scale N`     |   4     | Downsample factor (4 = quarter resolution) |
+| `--threshold N` |   20    | Brightness threshold for outer-envelope detection (0–255) |
+| `--jump-warn N` |   50    | Warn if circle centre moves > N px between frames |
+| `--no-spots`    |   off   | Disable bright internal-reflection spot detection (on by default) |
+| `--spot-threshold F` | 0.35 | Brightness excess over local background to flag a spot (lower = more sensitive) |
 
 Example:
 
@@ -138,6 +169,17 @@ useful, these existing `.oln` files should have been created by a person finding
 themselves. If done correctly, these outlines can be considered as "ground truth", and `--compare`
 shows how well `igram_finder` has done in comparison.
 
+By default `igram_finder` also looks for **bright internal-reflection spots** inside the mirror —
+compact bright glows caused by a stray reflection somewhere in the optical system, which corrupt the
+wavefront if left in. Any it finds are written as polygon `regions` in the `.oln` so DFTFringe
+ignores those pixels. A spot is flagged where the fringe-suppressed brightness rises above the
+smooth local background by at least `--spot-threshold` (a fraction, default `0.35` = 35 %). Bright
+damaging spots sit well above this; lower the threshold to also catch fainter ones (at some risk of
+false positives), or use `--no-spots` to turn the feature off. Because a reflection is fixed in the
+optical system, each frame's search is seeded from the previous frame's spots, so a spot that dims
+slightly between frames is still caught. Spot detection is skipped/unreliable on near-zero-tilt
+`[low-fringe]` images, which DFTFringe does not process anyway.
+
 ### Evaluate accuracy across a dataset tree
 
 ```bash
@@ -150,13 +192,13 @@ per-image and per-dataset accuracy.
 
 Common options:
 
-| Option | Default | Description |
-|---|---|---|
-| `--verbose` / `-v` | off | Print per-image detection details |
-| `--summary-only` | off | Skip per-directory listing |
-| `--scale N` | 4 | Downsample factor |
-| `--threshold N` | 20 | Brightness threshold |
-| `--overexp-thresh T` | 0.10 | Flag images with ≥ T fraction of saturated pixels |
+| Option               | Default | Description |
+|----------------------|---------|-------------|
+| `--verbose` / `-v`   | off     | Print per-image detection details |
+| `--summary-only`     | off     | Skip per-directory listing |
+| `--scale N`          | 4       | Downsample factor |
+| `--threshold N`      | 20      | Brightness threshold |
+| `--overexp-thresh T` | 0.10    | Flag images with ≥ T fraction of saturated pixels |
 
 ---
 
@@ -170,12 +212,18 @@ source JPEG:
     "dft_filter_radius": 25,
     "inside_outline":  { "center_x": -1, "center_y": -1, "radius_x": 0, "radius_y": 0 },
     "outside_outline": { "center_x": 2847.3, "center_y": 1992.1, "radius_x": 831.7, "radius_y": 831.7 },
-    "regions": []
+    "regions": [
+        [ { "x": 3120, "y": 2024 }, { "x": 3172, "y": 2090 }, { "x": 3128, "y": 2092 } ]
+    ]
 }
 ```
 
 All coordinates are in full-resolution pixels, origin at the top-left corner
 (standard image convention, which DFTFringe uses).
+
+`regions` is a list of polygons marking bright internal-reflection spots for
+DFTFringe to ignore; each polygon is a list of `{ "x", "y" }` vertices. It is
+empty when no spots are found (or when `--no-spots` is used).
 
 ---
 
@@ -192,6 +240,10 @@ See `ALGORITHM.md` for a full explanation.  In brief:
 4. **Radial gradient refinement** — snaps the circle to the actual mirror edge
    at sub-pixel accuracy by finding the steepest brightness drop at each of
    720 radial angles.
+5. **Bright-spot detection** — a fringe-suppressing blur minus a smooth
+   background (large morphological opening) isolates compact bright
+   internal-reflection glows; blobs whose excess exceeds `--spot-threshold` of
+   the local background, after area and count sanity filters, become `regions`.
 
 Optional fallbacks handle edge cases: outer-ring latch (Stage 3 grabs the
 illumination envelope), prev-circle mismatch (Stage 4 jumps > 10 % between

@@ -18,6 +18,9 @@ Detection pipeline:
      radial segment and finds the sharpest brightness drop (the mirror edge).
      A second RANSAC fit to those per-angle edge points converges to the
      circle that "splits the edge pixels" as DFTFringe expects.
+  5. Bright-spot detection — finds compact bright glows inside the mirror that
+     come from internal reflections in the optical system.  These are written
+     as polygon "regions" in the .oln so DFTFringe ignores those pixels.
 
 Typical accuracy on test data: Δcenter ≤ 5 px, Δradius ≤ 5 px in
 full-resolution (6000 × 4000) images.  Processing time: ~0.4 s/image.
@@ -33,6 +36,8 @@ Options:
     --scale N      Downsample factor — 4 means work at 1/4 resolution (default: 4)
     --jump-warn N  Warn if circle center moves > N px between frames (default: 50)
     --re-look      Second pass: use session consensus to re-anchor outlier detections
+    --no-spots     Disable bright internal-reflection spot detection (on by default)
+    --spot-threshold F  Brightness excess over local background to flag a spot (default: 0.35)
 """
 
 import argparse
@@ -59,6 +64,33 @@ LOW_FRINGE_SCORE: float = 0.10
 # close) and at most _RELOOK_MAX_PX (otherwise the mirror may have moved).
 _RELOOK_MIN_PX: float = 20.0
 _RELOOK_MAX_PX: float = 80.0
+
+# Bright-spot (internal-reflection) detection.  A spot is flagged where the
+# fringe-suppressed brightness rises above the smooth local background by at
+# least SPOT_THRESHOLD (a fraction of that background).  Ground-truth bright
+# spots sit 45-76 % over background; subtle harmless ones 13-22 %, so a default
+# of 0.35 catches the damaging spots while ignoring the subtle ones.
+SPOT_THRESHOLD: float = 0.35
+
+# Near a spot found in the previous frame, the threshold is relaxed by this
+# factor (hysteresis) so a spot that dims slightly between frames is still
+# caught.  The same physical reflection persists across a session.
+_SPOT_PREV_RELAX: float = 0.6
+
+# Minimum blob area (in detection-scale pixels) to accept as a spot, rejecting
+# isolated noise.  A real spot is ~12-16 px across at scale 4.
+_SPOT_MIN_AREA: int = 30
+
+# Maximum spot radius as a fraction of the mirror radius.  Internal reflections
+# are compact (~7 % of the mirror radius in the ground truth); blobs larger than
+# this are the broad brightness undulations of a low-tilt image, not a spot.
+# Scale-invariant because it is relative to the (also-scaled) mirror radius.
+_SPOT_MAX_RADIUS_FRAC: float = 0.12
+
+# A genuine reflection produces one or two spots.  If a single frame yields more
+# than this many candidates it is a low-tilt fringe-undulation storm, not a set
+# of real reflections, so all of its candidates are rejected.
+_SPOT_MAX_COUNT: int = 3
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +229,137 @@ def refine_by_radial_gradient(
 
 
 # ---------------------------------------------------------------------------
+# Bright-spot (internal-reflection) detection
+# ---------------------------------------------------------------------------
+
+def detect_spots(
+    small: np.ndarray,
+    cx_s: float,
+    cy_s: float,
+    r_s: float,
+    scale: int = 4,
+    threshold: float = SPOT_THRESHOLD,
+    prev_spots: Optional[list] = None,
+    blur_sigma: float = 6.0,
+    rim_frac: float = 0.07,
+) -> list:
+    """
+    Find bright internal-reflection spots inside the mirror aperture.
+
+    An internal reflection adds a compact, smooth bright glow on top of the
+    fringes.  It is detected as a "top-hat": the fringe-suppressed brightness
+    (`small` blurred to remove fringes) minus a smooth background estimate (a
+    large morphological opening that erases compact spots but preserves the
+    mirror's slow brightness gradient).  A pixel is flagged when that excess
+    exceeds `threshold` times the local background — a relative measure that is
+    independent of exposure and of the mirror's overall brightness gradient.
+
+    Parameters
+    ----------
+    small       : grayscale image at detection scale
+    cx_s, cy_s  : mirror centre (small-scale pixels)
+    r_s         : mirror radius (small-scale pixels)
+    scale       : downsample factor, used to convert polygons back to full res
+    threshold   : minimum brightness excess over local background, as a
+                  fraction of that background (default SPOT_THRESHOLD)
+    prev_spots  : spots found in the previous frame (full-resolution polygons);
+                  near these locations the threshold is relaxed (hysteresis)
+    blur_sigma  : Gaussian sigma to suppress fringe texture (default 6)
+    rim_frac    : fraction of the radius excluded at the mirror edge, where the
+                  brightness step would otherwise create false top-hat (0.07)
+
+    Returns a list of polygons (each a list of ``{"x", "y"}`` dicts in
+    full-resolution pixels), one per detected spot.  Empty if none found.
+    """
+    h, w = small.shape
+    lp = cv2.GaussianBlur(small.astype(np.float32), (0, 0), blur_sigma)
+
+    # Smooth background: morphological opening with a kernel larger than any
+    # spot removes the spots but follows the mirror's broad brightness field.
+    # The background is smooth, so the opening is computed on a 2x-downsampled
+    # copy (kernel and image both shrink) and resized back — ~16x faster than
+    # opening at full detection scale, with no meaningful accuracy loss.
+    ds = 2
+    lp_ds = cv2.resize(lp, (w // ds, h // ds), interpolation=cv2.INTER_AREA)
+    ksz = max(3, int(r_s / ds * 0.35)) | 1
+    bg_ds = cv2.morphologyEx(
+        lp_ds, cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz)),
+    )
+    bg = cv2.resize(bg_ds, (w, h), interpolation=cv2.INTER_LINEAR)
+    tophat = lp - bg
+
+    # Search only inside the mirror, minus a thin rim.
+    yy, xx = np.ogrid[:h, :w]
+    search_r = r_s * (1.0 - rim_frac)
+    mirror = (xx - cx_s) ** 2 + (yy - cy_s) ** 2 <= search_r ** 2
+
+    hot = (tophat > threshold * bg) & mirror
+
+    # Hysteresis: relax the threshold near spots seen in the previous frame.
+    if prev_spots:
+        prev_mask = np.zeros((h, w), np.uint8)
+        for poly in prev_spots:
+            try:
+                p = np.array(
+                    [[pt["x"] / scale, pt["y"] / scale] for pt in poly],
+                    dtype=np.int32,
+                )
+            except (KeyError, TypeError):
+                continue
+            if len(p) >= 3:
+                cv2.fillPoly(prev_mask, [p], 1)
+        if prev_mask.any():
+            prev_mask = cv2.dilate(
+                prev_mask,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)),
+            )
+            relaxed = (tophat > _SPOT_PREV_RELAX * threshold * bg) & mirror
+            hot = hot | (relaxed & (prev_mask > 0))
+
+    hot_u8 = hot.astype(np.uint8)
+    # Close small gaps, then dilate slightly so the polygon generously covers
+    # the spot halo (DFTFringe ignores the region, so erring large is safe).
+    hot_u8 = cv2.morphologyEx(
+        hot_u8, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+    )
+    hot_u8 = cv2.dilate(
+        hot_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    )
+
+    # Reject blobs larger than a plausible reflection (low-tilt undulations).
+    max_area = np.pi * (_SPOT_MAX_RADIUS_FRAC * r_s) ** 2
+
+    n_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(hot_u8, connectivity=8)
+    regions: list = []
+    for i in range(1, n_lbl):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area < _SPOT_MIN_AREA or area > max_area:
+            continue
+        comp = (labels == i).astype(np.uint8)
+        conts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not conts:
+            continue
+        c = max(conts, key=cv2.contourArea)
+        eps = 0.01 * cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, eps, True)
+        poly = [
+            {"x": int(round(pt[0][0] * scale)), "y": int(round(pt[0][1] * scale))}
+            for pt in approx
+        ]
+        if len(poly) >= 3:
+            regions.append(poly)
+
+    # A frame with too many candidates is a low-tilt fringe storm, not a set of
+    # real reflections — reject them all.
+    if len(regions) > _SPOT_MAX_COUNT:
+        return []
+
+    return regions
+
+
+# ---------------------------------------------------------------------------
 # Core detection
 # ---------------------------------------------------------------------------
 
@@ -206,7 +369,10 @@ def detect_mirror(
     threshold: int = 20,
     prev_circle: Optional[tuple[float, float, float]] = None,
     jump_warn: float = 50.0,
-) -> Optional[tuple[float, float, float, float]]:
+    find_spots: bool = True,
+    spot_threshold: float = SPOT_THRESHOLD,
+    prev_spots: Optional[list] = None,
+) -> Optional[tuple[float, float, float, float, list]]:
     """
     Detect the mirror aperture circle in an interferogram image.
 
@@ -218,10 +384,12 @@ def detect_mirror(
     The outer envelope provides a spatial bound; RANSAC on the fringe-region
     contour finds the mirror circle even when fringe brightness is uneven.
 
-    Returns (center_x, center_y, radius, fringe_score) in full-image pixels,
-    or None.  fringe_score is a normalised measure of fringe visibility;
-    values below LOW_FRINGE_SCORE indicate a near-zero-tilt (low-fringe)
-    image that is not suitable for DFTFringe processing.
+    Returns (center_x, center_y, radius, fringe_score, regions) in full-image
+    pixels, or None.  fringe_score is a normalised measure of fringe
+    visibility; values below LOW_FRINGE_SCORE indicate a near-zero-tilt
+    (low-fringe) image that is not suitable for DFTFringe processing.  regions
+    is a list of bright internal-reflection spot polygons (empty when
+    find_spots is False or none are found); see detect_spots.
     """
     img_bgr = cv2.imread(str(image_path))
     if img_bgr is None:
@@ -397,7 +565,15 @@ def detect_mirror(
                 f"center moved {dist:.1f}px, radius Δ{r_diff:.1f}px"
             )
 
-    return cx, cy, radius, fringe_score
+    # Bright internal-reflection spots inside the (now refined) mirror circle.
+    regions: list = []
+    if find_spots:
+        regions = detect_spots(
+            small, cx_s, cy_s, r_s,
+            scale=scale, threshold=spot_threshold, prev_spots=prev_spots,
+        )
+
+    return cx, cy, radius, fringe_score, regions
 
 
 # ---------------------------------------------------------------------------
@@ -415,14 +591,39 @@ def load_oln_circle(oln_path: Path) -> Optional[tuple[float, float, float]]:
         return None
 
 
+def load_oln_regions(oln_path: Path) -> list:
+    """
+    Read the `regions` polygon list from an existing .oln file.
+
+    Returns a list of polygons (each a list of ``{"x", "y"}`` dicts), or an
+    empty list if the file is missing, unparseable, or has no regions.  Used to
+    seed the previous-frame spot search when an image is skipped.
+    """
+    try:
+        with open(oln_path) as f:
+            d = json.load(f)
+        regions = d.get("regions", [])
+        return regions if isinstance(regions, list) else []
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+
+
 def write_oln(
     oln_path: Path,
     cx: float,
     cy: float,
     radius: float,
+    regions: Optional[list] = None,
     dft_filter_radius: int = 25,
 ) -> None:
-    """Write a DFTFringe .oln file."""
+    """
+    Write a DFTFringe .oln file.
+
+    `regions` is an optional list of polygons marking bright internal-reflection
+    spots that DFTFringe should ignore.  Each polygon is a list of
+    ``{"x": int, "y": int}`` vertices in full-resolution pixels.  When omitted,
+    an empty list is written (no regions).
+    """
     data = {
         "dft_filter_radius": dft_filter_radius,
         "inside_outline": {
@@ -437,7 +638,7 @@ def write_oln(
             "radius_x": radius,
             "radius_y": radius,
         },
-        "regions": [],
+        "regions": regions if regions is not None else [],
     }
     with open(oln_path, "w") as f:
         json.dump(data, f, indent=4)
@@ -463,14 +664,15 @@ def _second_pass(
     window are either already correct (< 20) or the mirror has genuinely
     moved (> 80) and must not be overridden.
 
-    `results` is a list of (img_path, cx, cy, radius, fringe_score) tuples
-    in full-resolution pixels.  Returns an updated list with the same
+    `results` is a list of (img_path, cx, cy, radius, fringe_score, regions)
+    tuples in full-resolution pixels.  Returns an updated list with the same
     structure; .oln files are rewritten for any accepted re-looks (unless
-    dry_run is True).
+    dry_run is True).  The re-look only re-anchors the mirror circle; any spot
+    regions already found in the first pass are preserved unchanged.
     """
     high_fringe = [
         (cx, cy, r)
-        for _, cx, cy, r, fs in results
+        for _, cx, cy, r, fs, _ in results
         if fs >= LOW_FRINGE_SCORE
     ]
     if len(high_fringe) < 3:
@@ -481,9 +683,9 @@ def _second_pass(
     r_c  = float(np.median([c[2] for c in high_fringe]))
 
     updated = []
-    for img_path, cx, cy, r, fs in results:
+    for img_path, cx, cy, r, fs, regions in results:
         if fs < LOW_FRINGE_SCORE:
-            updated.append((img_path, cx, cy, r, fs))
+            updated.append((img_path, cx, cy, r, fs, regions))
             continue
 
         d_old = float(np.hypot(cx - cx_c, cy - cy_c))
@@ -491,13 +693,13 @@ def _second_pass(
 
         if d_old < _RELOOK_MIN_PX or d_old > _RELOOK_MAX_PX:
             # Too close (already good) or too far (mirror repositioned)
-            updated.append((img_path, cx, cy, r, fs))
+            updated.append((img_path, cx, cy, r, fs, regions))
             continue
 
         # Reload image and re-run Stage 4 from consensus seed
         img_bgr = cv2.imread(str(img_path))
         if img_bgr is None:
-            updated.append((img_path, cx, cy, r, fs))
+            updated.append((img_path, cx, cy, r, fs, regions))
             continue
         img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
         h, w = img_gray.shape
@@ -522,10 +724,10 @@ def _second_pass(
                 f" → cx={new_cx:.1f} cy={new_cy:.1f} r={new_r:.1f}{tag}"
             )
             if not dry_run:
-                write_oln(img_path.with_suffix(".oln"), new_cx, new_cy, new_r)
-            updated.append((img_path, new_cx, new_cy, new_r, fs))
+                write_oln(img_path.with_suffix(".oln"), new_cx, new_cy, new_r, regions)
+            updated.append((img_path, new_cx, new_cy, new_r, fs, regions))
         else:
-            updated.append((img_path, cx, cy, r, fs))
+            updated.append((img_path, cx, cy, r, fs, regions))
 
     return updated
 
@@ -543,6 +745,8 @@ def process_directory(
     threshold: int = 20,
     jump_warn: float = 50.0,
     re_look: bool = False,
+    find_spots: bool = True,
+    spot_threshold: float = SPOT_THRESHOLD,
 ) -> None:
     """
     Process all JPEG images in `directory`.
@@ -569,8 +773,10 @@ def process_directory(
         print(f"Found {len(images)} image(s) in {directory}")
 
     prev_circle: Optional[tuple[float, float, float]] = None
+    prev_spots: list = []
     processed = skipped = failed = 0
-    all_results: list[tuple] = []  # (img_path, cx, cy, radius, fringe_score)
+    # (img_path, cx, cy, radius, fringe_score, regions)
+    all_results: list[tuple] = []
 
     for img_path in images:
         oln_path = img_path.with_suffix(".oln")
@@ -579,6 +785,7 @@ def process_directory(
             existing = load_oln_circle(oln_path)
             if existing:
                 prev_circle = existing
+            prev_spots = load_oln_regions(oln_path)
             print(f"  {img_path.name}: skipped (already has .oln)")
             skipped += 1
             continue
@@ -591,6 +798,9 @@ def process_directory(
             threshold=threshold,
             prev_circle=prev_circle,
             jump_warn=jump_warn,
+            find_spots=find_spots,
+            spot_threshold=spot_threshold,
+            prev_spots=prev_spots,
         )
 
         if result is None:
@@ -598,8 +808,9 @@ def process_directory(
             failed += 1
             continue
 
-        cx, cy, radius, fringe_score = result
+        cx, cy, radius, fringe_score, regions = result
         fringe_tag = " [low-fringe]" if fringe_score < LOW_FRINGE_SCORE else ""
+        spot_tag = f" [{len(regions)} spot(s)]" if regions else ""
 
         if compare:
             existing = load_oln_circle(oln_path)
@@ -607,25 +818,29 @@ def process_directory(
                 ex, ey, er = existing
                 d_center = np.hypot(cx - ex, cy - ey)
                 d_radius = abs(radius - er)
+                existing_regions = load_oln_regions(oln_path)
                 print(
                     f" cx={cx:.1f} cy={cy:.1f} r={radius:.1f}  fringe={fringe_score:.2f} | "
                     f"existing cx={ex:.1f} cy={ey:.1f} r={er:.1f} | "
                     f"Δcenter={d_center:.1f}px Δr={d_radius:.1f}px{fringe_tag}"
+                    f" | spots {len(regions)} vs {len(existing_regions)} curated"
                 )
             else:
-                print(f" cx={cx:.1f} cy={cy:.1f} r={radius:.1f}  fringe={fringe_score:.2f}{fringe_tag}")
+                print(f" cx={cx:.1f} cy={cy:.1f} r={radius:.1f}  fringe={fringe_score:.2f}{fringe_tag}{spot_tag}")
             prev_circle = (cx, cy, radius)
+            prev_spots = regions
             processed += 1
             continue
 
         tag = " [dry-run]" if dry_run else ""
-        print(f" cx={cx:.1f} cy={cy:.1f} r={radius:.1f}  fringe={fringe_score:.2f}{fringe_tag}{tag}")
+        print(f" cx={cx:.1f} cy={cy:.1f} r={radius:.1f}  fringe={fringe_score:.2f}{fringe_tag}{spot_tag}{tag}")
 
         if not dry_run:
-            write_oln(oln_path, cx, cy, radius)
+            write_oln(oln_path, cx, cy, radius, regions)
 
         prev_circle = (cx, cy, radius)
-        all_results.append((img_path, cx, cy, radius, fringe_score))
+        prev_spots = regions
+        all_results.append((img_path, cx, cy, radius, fringe_score, regions))
         processed += 1
 
     if re_look and all_results:
@@ -700,6 +915,24 @@ def main() -> None:
             "re-anchor detections that differ from consensus by 20–80 px"
         ),
     )
+    parser.add_argument(
+        "--no-spots",
+        action="store_true",
+        help=(
+            "Disable detection of bright internal-reflection spots "
+            "(spot detection is on by default)"
+        ),
+    )
+    parser.add_argument(
+        "--spot-threshold",
+        type=float,
+        default=SPOT_THRESHOLD,
+        metavar="F",
+        help=(
+            "Brightness excess over local background, as a fraction, to flag a "
+            f"bright spot (default: {SPOT_THRESHOLD}; lower = more sensitive)"
+        ),
+    )
     args = parser.parse_args()
 
     directory = Path(args.directory)
@@ -716,6 +949,8 @@ def main() -> None:
         threshold=args.threshold,
         jump_warn=args.jump_warn,
         re_look=args.re_look,
+        find_spots=not args.no_spots,
+        spot_threshold=args.spot_threshold,
     )
 
 
