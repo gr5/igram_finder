@@ -14,6 +14,7 @@ Right panel : image list (top) + zoomed circle preview (bottom).
 """
 
 import io
+import json
 import queue
 import sys
 import threading
@@ -45,6 +46,52 @@ _SYM = {
     "skipped":    "[S]",
     "failed":     "[!]",
 }
+
+
+# ── persisted GUI state (remembers last-used directory) ───────────────────────
+
+_CONFIG_PATH = Path.home() / ".igram_finder_gui.json"
+
+
+def _load_last_dir() -> Optional[str]:
+    """Return the last directory the user browsed to, if still valid."""
+    try:
+        data = json.loads(_CONFIG_PATH.read_text())
+        last = data.get("last_dir")
+        if last and Path(last).is_dir():
+            return last
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _save_last_dir(path: str) -> None:
+    try:
+        _CONFIG_PATH.write_text(json.dumps({"last_dir": path}))
+    except OSError:
+        pass
+
+
+# ── mouse-wheel scrolling for Listbox widgets ─────────────────────────────────
+
+def _bind_mousewheel(widget: tk.Listbox) -> None:
+    """Make a Listbox scroll with the mouse wheel on X11, Windows and macOS.
+
+    On X11 the wheel arrives as Button-4 (up) / Button-5 (down); on Windows and
+    macOS it arrives as <MouseWheel> with a signed ``delta``.
+    """
+    def _on_wheel(event: tk.Event) -> str:
+        if getattr(event, "num", None) == 4:
+            widget.yview_scroll(-3, "units")
+        elif getattr(event, "num", None) == 5:
+            widget.yview_scroll(3, "units")
+        elif getattr(event, "delta", 0):
+            widget.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
+
+    widget.bind("<MouseWheel>", _on_wheel)   # Windows / macOS
+    widget.bind("<Button-4>", _on_wheel)     # X11 wheel up
+    widget.bind("<Button-5>", _on_wheel)     # X11 wheel down
 
 
 # ── thread-safe stdout capture ────────────────────────────────────────────────
@@ -113,6 +160,7 @@ class _MultiDirDialog:
         sb = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=self._lb.yview)
         sb.grid(row=0, column=1, sticky="ns")
         self._lb.config(yscrollcommand=sb.set)
+        _bind_mousewheel(self._lb)
 
         for label, _ in options:
             self._lb.insert(tk.END, label)
@@ -158,6 +206,7 @@ class IgramFinderGUI:
         self._results: dict[str, dict] = {}
         self._image_paths: list[Path] = []   # ordered for listbox index alignment
         self._directories: list[Path] = []
+        self._last_dir: Optional[str] = _load_last_dir()  # for browse dialog
 
         # threading
         self._work_queue: queue.Queue = queue.Queue()
@@ -212,6 +261,7 @@ class IgramFinderGUI:
                            command=self._dir_lb.yview)
         sb.grid(row=0, column=1, sticky="ns")
         self._dir_lb.config(yscrollcommand=sb.set)
+        _bind_mousewheel(self._dir_lb)
 
         bf = ttk.Frame(parent)
         bf.grid(row=row, column=0, sticky="w", pady=(2, 6)); row += 1
@@ -307,6 +357,7 @@ class IgramFinderGUI:
         sb2.grid(row=1, column=1, sticky="ns")
         self._img_lb.config(yscrollcommand=sb2.set)
         self._img_lb.bind("<<ListboxSelect>>", self._on_image_select)
+        _bind_mousewheel(self._img_lb)
 
         # status line below the list
         self._img_status_var = tk.StringVar(value="")
@@ -332,10 +383,14 @@ class IgramFinderGUI:
 
     def _add_directory(self) -> None:
         raw = filedialog.askdirectory(
-            title="Select directory (or parent of session directories)")
+            title="Select directory (or parent of session directories)",
+            initialdir=self._last_dir)
         if not raw:
             return
         root = Path(raw)
+        # Remember this location so the next browse starts here.
+        self._last_dir = raw
+        _save_last_dir(raw)
 
         def _jpeg_count(d: Path) -> int:
             try:
