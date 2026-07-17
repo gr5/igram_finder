@@ -1,0 +1,7 @@
+# igram_finder runtime dependencies
+# Everything else (tkinter, io, json, queue, threading, pathlib, argparse)
+# is part of the Python standard library.
+numpy==2.2.2
+opencv-python==4.11.0.86
+Pillow==11.2.1
+scipy==1.16.0
