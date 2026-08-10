@@ -115,7 +115,7 @@ python igram_finder_gui.py
 The left panel lets you add/remove directories, set all detection options, and
 start or cancel a run.  The right panel lists every image with a status symbol
 (`[✓]` ok, `[~]` low-fringe, `[!]` failed, `[S]` skipped) — click any entry
-to see a cropped preview of the detected circle.
+to see a cropped preview of the detected circle. Double click to de-select it.
 
 ---
 

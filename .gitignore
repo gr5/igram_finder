@@ -1,3 +1,8 @@
 .idea/
 __pycache__/
+venv/
+igrams/
 *~
+*.tgz
+*.eze
+*.zip

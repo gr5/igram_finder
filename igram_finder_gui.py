@@ -212,6 +212,7 @@ class IgramFinderGUI:
         self._work_queue: queue.Queue = queue.Queue()
         self._cancel_flag = threading.Event()
         self._running = False
+        self._run_included: set[str] = set()   # snapshot of paths to process
 
         # preview cache — avoid re-reading the JPEG on every canvas resize
         self._crop_bgr: Optional[np.ndarray] = None   # BGR crop with circle drawn
@@ -345,7 +346,8 @@ class IgramFinderGUI:
         top.rowconfigure(1, weight=1)
         paned.add(top, minsize=120, height=220)
 
-        ttk.Label(top, text="Images  (click to preview):").grid(
+        self._img_count_var = tk.StringVar(value="Images  (click to preview):")
+        ttk.Label(top, textvariable=self._img_count_var).grid(
             row=0, column=0, columnspan=2, sticky="w")
 
         self._img_lb = tk.Listbox(
@@ -357,13 +359,27 @@ class IgramFinderGUI:
         sb2.grid(row=1, column=1, sticky="ns")
         self._img_lb.config(yscrollcommand=sb2.set)
         self._img_lb.bind("<<ListboxSelect>>", self._on_image_select)
+        self._img_lb.bind("<space>", self._toggle_selected)
+        self._img_lb.bind("<Double-Button-1>", self._toggle_selected)
         _bind_mousewheel(self._img_lb)
+
+        # selection controls
+        self_frame = ttk.Frame(top)
+        self_frame.grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ttk.Button(self_frame, text="Select All", width=11,
+                   command=lambda: self._set_all_included(True)).pack(
+            side=tk.LEFT, padx=2)
+        ttk.Button(self_frame, text="Deselect All", width=12,
+                   command=lambda: self._set_all_included(False)).pack(
+            side=tk.LEFT, padx=2)
+        ttk.Button(self_frame, text="Toggle", width=8,
+                   command=self._toggle_selected).pack(side=tk.LEFT, padx=2)
 
         # status line below the list
         self._img_status_var = tk.StringVar(value="")
         ttk.Label(top, textvariable=self._img_status_var,
                   font=("Courier", 9), anchor="w").grid(
-            row=2, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+            row=3, column=0, columnspan=2, sticky="ew", pady=(2, 0))
 
         # bottom: preview canvas
         bot = ttk.Frame(paned, padding=(4, 4))
@@ -456,6 +472,7 @@ class IgramFinderGUI:
                 self._image_paths.append(p)
                 self._results.setdefault(str(p), {
                     "status": "pending",
+                    "included": True,
                     "cx": None, "cy": None,
                     "radius": None, "fringe_score": None,
                     "regions": None,
@@ -465,16 +482,23 @@ class IgramFinderGUI:
 
     # ── image listbox helpers ─────────────────────────────────────────────────
 
+    def _is_included(self, p: Path) -> bool:
+        return self._results.get(str(p), {}).get("included", True)
+
     def _img_label(self, p: Path) -> str:
         info = self._results.get(str(p), {})
         sym = _SYM.get(info.get("status", "pending"), "[ ]")
+        inc = "☑" if info.get("included", True) else "☐"
         name = f"{p.parent.name}/{p.name}" if len(self._directories) > 1 else p.name
-        return f"{sym} {name}"
+        return f"{inc} {sym} {name}"
 
     def _rebuild_img_listbox(self) -> None:
         self._img_lb.delete(0, tk.END)
-        for p in self._image_paths:
+        for i, p in enumerate(self._image_paths):
             self._img_lb.insert(tk.END, self._img_label(p))
+            if not self._is_included(p):
+                self._img_lb.itemconfig(i, foreground="#999999")
+        self._update_count()
 
     def _update_img_entry(self, p: Path) -> None:
         try:
@@ -483,6 +507,40 @@ class IgramFinderGUI:
             return
         self._img_lb.delete(idx)
         self._img_lb.insert(idx, self._img_label(p))
+        if not self._is_included(p):
+            self._img_lb.itemconfig(idx, foreground="#999999")
+
+    def _update_count(self) -> None:
+        total = len(self._image_paths)
+        inc = sum(1 for p in self._image_paths if self._is_included(p))
+        self._img_count_var.set(
+            f"Images — {inc}/{total} selected  "
+            f"(click = preview, Space / double-click = toggle):")
+
+    # ── inclusion toggling ────────────────────────────────────────────────────
+
+    def _toggle_selected(self, _event: Optional[tk.Event] = None) -> str:
+        sel = self._img_lb.curselection()
+        if sel and sel[0] < len(self._image_paths):
+            idx = sel[0]
+            p = self._image_paths[idx]
+            info = self._results.get(str(p))
+            if info is not None:
+                info["included"] = not info.get("included", True)
+                self._update_img_entry(p)
+                # re-inserting the row clears selection — restore it so
+                # repeated Space presses keep toggling the same image
+                self._img_lb.selection_set(idx)
+                self._img_lb.activate(idx)
+                self._update_count()
+        return "break"   # swallow the key so the Listbox default doesn't fire
+
+    def _set_all_included(self, value: bool) -> None:
+        for p in self._image_paths:
+            info = self._results.get(str(p))
+            if info is not None:
+                info["included"] = value
+        self._rebuild_img_listbox()
 
     # ── run / cancel ──────────────────────────────────────────────────────────
 
@@ -490,13 +548,22 @@ class IgramFinderGUI:
         if not self._image_paths:
             self._log("No images to process — add a directory first.")
             return
+        included = [p for p in self._image_paths if self._is_included(p)]
+        if not included:
+            self._log("No images selected — tick at least one "
+                      "(Space or double-click).")
+            return
+
         self._running = True
         self._cancel_flag.clear()
         self._run_btn.config(state=tk.DISABLED)
         self._cancel_btn.config(state=tk.NORMAL)
 
-        # reset all to pending
-        for p in self._image_paths:
+        # snapshot the selection so toggling during a run can't change it
+        self._run_included = {str(p) for p in included}
+
+        # reset only the selected images to pending
+        for p in included:
             self._results[str(p)]["status"] = "pending"
         self._rebuild_img_listbox()
 
@@ -528,7 +595,9 @@ class IgramFinderGUI:
                     break
 
                 self._work_queue.put(("log", f"\n─── {directory} ───"))
-                images = [p for p in self._image_paths if p.parent == directory]
+                images = [p for p in self._image_paths
+                          if p.parent == directory
+                          and str(p) in self._run_included]
 
                 if compare:
                     images = [p for p in images if p.with_suffix(".oln").exists()]
