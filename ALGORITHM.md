@@ -1,10 +1,10 @@
 # igram_finder Algorithm
 
 This document explains how `igram_finder.py` locates the circular mirror aperture
-in a Bath interferogram JPEG and encodes the result as a DFTFringe `.oln` outline
-file.  It is written for someone who already understands Bath interferometry and
-DFTFringe but wants to know exactly what the code is doing and why each decision
-was made.
+in a Bath interferogram JPEG, finds bright internal-reflection spots inside that
+aperture, and encodes both as a DFTFringe `.oln` outline file.  It is written for
+someone who already understands Bath interferometry and DFTFringe but wants to
+know exactly what the code is doing and why each decision was made.
 
 ---
 
@@ -47,8 +47,8 @@ on the optical layout and changes slightly between sessions.
 ## Processing overview
 
 All computation runs on a downsampled (scale = 4 by default, so 1500 × 1000 or
-864 × 1296) grayscale copy of the image.  The final circle is scaled back to
-full-resolution pixels.
+864 × 1296) grayscale copy of the image.  The final circle and any spot polygons
+are scaled back to full-resolution pixels.
 
 ```
 JPEG  →  grayscale  →  ¼-scale
@@ -64,7 +64,11 @@ JPEG  →  grayscale  →  ¼-scale
          ├── Stage 4: radial gradient refinement
          │              (+ prev-circle fallback if radius jumps > 10 %)
          │
-         ├── result (cx, cy, radius, fringe_score) → .oln
+         ├── Stage 5: bright-spot (internal-reflection) detection
+         │              (on by default; --no-spots disables)
+         │              + prev-frame hysteresis seeding
+         │
+         ├── result (cx, cy, radius, fringe_score, regions) → .oln
          │
          └── optional second pass (--re-look):
                 session consensus → re-anchor outliers (20–80 px window)
@@ -264,6 +268,108 @@ boundary.
 
 ---
 
+## Stage 5 — Bright internal-reflection spot detection
+
+**Goal:** find compact bright glows *inside* the mirror aperture that come from a
+stray internal reflection in the optical system, and emit them as polygon
+`regions` in the `.oln` so DFTFringe ignores those pixels.
+
+Spot detection is **on by default**; `--no-spots` disables it.  It runs after
+Stage 4 (`detect_spots()` is called from the end of `detect_mirror()`) so that it
+can use the refined circle to bound the search.
+
+**Physical basis:** an internal reflection lays a smooth bright glow on top of the
+fringes.  Measured against hand-drawn ground-truth regions it is ~50–65
+full-resolution px across (~7 % of the mirror radius), typically 20–28 % of the
+radius out from centre.  Unlike the fringes it is *low* spatial frequency, and
+unlike the mirror's overall illumination gradient it is *compact* — that pair of
+properties is what separates it from everything else in the aperture.
+
+**Steps** (all at detection scale unless noted):
+
+1. Gaussian blur with σ = 6 → `lp`.  This suppresses the fringe modulation while
+   leaving the broader glow intact.  (Stage 4 uses σ = 4 for the edge step; the
+   spot search blurs harder because it must erase fringes completely, not just
+   soften them.)
+
+2. Smooth background estimate `bg`: morphological opening of `lp` with an ellipse
+   kernel of ≈ 0.35 × `r_s`.  A kernel larger than any plausible spot erases the
+   spots but still follows the mirror's slow brightness field.  The opening is
+   computed on a 2×-downsampled copy (both image and kernel shrink) and resized
+   back — ~16× faster than opening at detection scale, with no meaningful
+   accuracy loss, since the background is smooth by construction.
+
+3. Top-hat: `tophat = lp − bg`.  Flag a pixel when
+
+   ```
+   tophat > threshold × bg          (threshold = SPOT_THRESHOLD = 0.35)
+   ```
+
+   The comparison is against the *local* background rather than an absolute
+   level, which makes it independent of exposure and of the mirror's overall
+   brightness gradient.
+
+4. Restrict the search to inside the mirror minus a thin rim (`rim_frac = 0.07`
+   of the radius).  The brightness step at the mirror edge would otherwise
+   produce a false top-hat ring all the way around.
+
+5. **Hysteresis from the previous frame:** the previous frame's polygons are
+   rasterised, dilated with a 31 × 31 ellipse, and inside that neighbourhood the
+   threshold is relaxed to `_SPOT_PREV_RELAX` (0.6) × threshold.  A spot that
+   dims slightly between frames is therefore still caught.
+
+6. Morphological close (5 × 5), then dilate (5 × 5), so the polygon generously
+   covers the spot's halo.  Erring large is safe — DFTFringe simply ignores the
+   region.
+
+7. Connected components.  Keep a blob only if
+   `_SPOT_MIN_AREA` (30 px) ≤ area ≤ π · (`_SPOT_MAX_RADIUS_FRAC` · `r_s`)²
+   with `_SPOT_MAX_RADIUS_FRAC = 0.12`.  Both bounds are expressed relative to
+   the (also scaled) mirror radius, so they are scale-invariant.
+
+8. Contour each surviving blob → `cv2.approxPolyDP` at 1 % of the arc length →
+   polygon, with vertices multiplied by `scale` back to full resolution.
+
+9. **Swarm rejection:** if more than `_SPOT_MAX_COUNT` (3) polygons survive,
+   return *none* of them.  A genuine reflection produces one or two spots; a
+   frame yielding many is a low-tilt fringe storm.
+
+**Why 0.35?**  The hand-curated ground truth separates cleanly in this measure:
+
+| Spot class | Excess over local background |
+|---|---|
+| Bright / damaging (every curated primary) | 45 – 76 % |
+| Subtle secondary | 13 – 22 % |
+
+A default of 0.35 catches every damaging spot and skips the subtle ones;
+`--spot-threshold 0.15` pulls the subtle ones in as well.  The value is a CLI knob
+precisely because the line between "harmless" and "damaging" is not yet settled.
+
+**Why the area cap and swarm rejection?**  A naive top-hat fired on 38 of 323
+images in the clean (no-defect) datasets, almost all of them low-tilt or
+zero-tilt frames whose widely-spaced fringes survive the σ = 6 blur and read as
+bright blobs.  The two filters cut spurious detections from 221 spots to 37 while
+retaining 17/17 curated primary spots, with detected centroids within 1–13 px of
+the hand-drawn ones.  Most of the 37 residual detections are not in fact false:
+they surfaced a genuine, previously-unlabelled reflection appearing at a stable
+image location (33 % of the radius from centre) in every rotation subdirectory of
+one session — the signature of an optically-fixed reflection.
+
+**Cross-frame seeding:** because the reflection is fixed in the optical system,
+its position is roughly stable across a session (it can drift a little and change
+intensity with the setup).  `process_directory` therefore chains `prev_spots`
+from frame to frame, exactly as it chains `prev_circle`; when an image is skipped
+because it already has an `.oln`, `load_oln_regions()` seeds the chain from that
+file instead.  The first image of a directory has no seed, so a spot sitting
+right at threshold may be missed there and caught on later frames.
+
+**Interaction with `--re-look`:** the second pass re-anchors the mirror circle
+only.  Whatever regions the first pass found are carried through unchanged.
+
+**Cost:** ~0.05 s/image, thanks to the downsampled background opening.
+
+---
+
 ## Fringe visibility score
 
 Computed alongside the variance map using a 5 × 5 uniform filter (faster
@@ -398,7 +504,7 @@ DFTFringe outline files are JSON with the following schema:
     "dft_filter_radius": 25,
     "inside_outline":  { "center_x": -1, "center_y": -1, "radius_x": 0, "radius_y": 0 },
     "outside_outline": { "center_x": cx, "center_y": cy, "radius_x": r, "radius_y": r },
-    "regions": []
+    "regions": [ [ {"x": x0, "y": y0}, {"x": x1, "y": y1}, ... ] ]
 }
 ```
 
@@ -408,7 +514,10 @@ DFTFringe outline files are JSON with the following schema:
   `cx = cy = −1` (disabled) because the mirrors tested are solid primaries.
 - `dft_filter_radius` — controls DFTFringe's Fourier filter, unrelated to the
   aperture circle.  We always write 25.
-- `regions` — a list of small polygonal exclusion zones.  We write an empty list.
+- `regions` — a list of polygonal exclusion zones that DFTFringe ignores.  Stage 5
+  writes one polygon per detected bright internal-reflection spot, each a list of
+  `{"x", "y"}` vertices in full-resolution pixels.  The list is empty when no
+  spots are found and when `--no-spots` is used.
 
 All coordinates are in full-resolution pixels, with the origin at the top-left of
 the image (standard image convention, which DFTFringe uses).
@@ -427,11 +536,12 @@ Tested on 6000 × 4000 Canon DSLR JPEGs, Intel Core i5, no GPU:
 - Image load + grayscale conversion: ~0.15 s
 - Stages 1–3 (threshold, variance, RANSAC): ~0.10 s
 - Stage 4 (720-angle gradient search + RANSAC): ~0.15 s
-- **Total: ~0.4 s per image**
+- Stage 5 (blur, downsampled opening, blob filtering): ~0.05 s
+- **Total: ~0.45 s per image** (~0.4 s with `--no-spots`)
 
 The bottleneck is Stage 4's Python loop over 720 angles.  Vectorising this with
 NumPy would reduce it to ~0.05 s but the current speed is acceptable for batch
-processing of a typical session (30–50 images ≈ 15–20 s total).
+processing of a typical session (30–50 images ≈ 15–25 s total).
 
 ---
 
@@ -470,6 +580,18 @@ outer-ring fallback corrects this automatically.
 the very first image in a session has an unusual appearance (severe fringe
 contrast, partial obstruction), the algorithm has no recovery mechanism.  In
 practice this has not been observed across ~700 tested images.
+
+**Spot false positives on low-tilt images:** The σ = 6 blur does not fully erase
+the widely-spaced fringes of a near-zero-tilt frame, so their broad undulations
+can read as bright blobs.  The area cap and swarm rejection remove the great
+majority, but a single near-threshold spot can still be emitted on such a frame.
+These are exactly the images DFTFringe does not process anyway; use `--no-spots`
+if the spurious regions are unwanted.
+
+**Subtle spots below the default threshold:** Secondary reflections sitting
+13–22 % over the local background are ignored by the 0.35 default.  Whether they
+need masking at all is not yet established; `--spot-threshold 0.15` includes them
+at some risk of false positives.
 
 **Over-exposure:** Saturated pixels (≥ 250 out of 255) clip the fringe contrast
 and reduce variance.  `igram_eval.py` reports a saturation fraction for each image
