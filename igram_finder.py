@@ -38,6 +38,7 @@ Options:
     --re-look      Second pass: use session consensus to re-anchor outlier detections
     --no-spots     Disable bright internal-reflection spot detection (on by default)
     --spot-threshold F  Brightness excess over local background to flag a spot (default: 0.35)
+    --save-steps   Save labelled intermediate step images for visual inspection
 """
 
 import argparse
@@ -91,6 +92,77 @@ _SPOT_MAX_RADIUS_FRAC: float = 0.12
 # than this many candidates it is a low-tilt fringe-undulation storm, not a set
 # of real reflections, so all of its candidates are rejected.
 _SPOT_MAX_COUNT: int = 3
+
+
+# ---------------------------------------------------------------------------
+# Step-image recording (for visual inspection of each processing step)
+# ---------------------------------------------------------------------------
+
+def _to_bgr_u8(image: np.ndarray) -> np.ndarray:
+    """
+    Convert a step image to an 8-bit BGR image for saving.
+
+    Accepts 2-D grayscale/binary/float maps (normalised so 0 = black,
+    max = white) and already-3-channel 8-bit BGR images.
+    """
+    arr = np.asarray(image)
+    if arr.ndim == 3 and arr.shape[2] == 3:
+        return arr.astype(np.uint8) if arr.dtype != np.uint8 else arr.copy()
+
+    arr = np.asarray(arr, dtype=np.float32)
+    arr = np.where(np.isfinite(arr), arr, np.float32(0.0))
+    vmax = float(arr.max())
+    if vmax <= 0.0:
+        vmax = 1.0
+    gray = np.clip(arr / vmax * 255.0, 0.0, 255.0).astype(np.uint8)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
+class StepWriter:
+    """
+    Saves labelled intermediate step images to disk for later visual
+    inspection and writes a manifest.json describing each image in order.
+    """
+
+    def __init__(self, out_dir: Path) -> None:
+        self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self._seq = 0
+        self.manifest: list[dict] = []
+
+    def add(
+        self,
+        stage: int,
+        step: int,
+        name: str,
+        image: np.ndarray,
+        title: str = "",
+        note: str = "",
+    ) -> Path:
+        """Save one step image and append its description to the manifest."""
+        self._seq += 1
+        fname = f"{self._seq:03d}_{stage:02d}_{step:02d}_{name}.png"
+        path = self.out_dir / fname
+        cv2.imwrite(str(path), _to_bgr_u8(image))
+        self.manifest.append(
+            {
+                "file": fname,
+                "seq": self._seq,
+                "stage": stage,
+                "step": step,
+                "name": name,
+                "title": title,
+                "note": note,
+            }
+        )
+        return path
+
+    def save_manifest(self) -> Path:
+        """Write manifest.json so viewers can enumerate the steps in order."""
+        path = self.out_dir / "manifest.json"
+        with open(path, "w") as f:
+            json.dump({"steps": self.manifest}, f, indent=2)
+        return path
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +244,8 @@ def refine_by_radial_gradient(
     search_half: int = 20,
     blur_sigma: float = 4.0,
     grad_threshold: float = 0.2,
+    step_writer: Optional[StepWriter] = None,
+    step_tag: str = "",
 ) -> tuple[float, float, float]:
     """
     Refine a circle estimate by sampling the brightness gradient along radial
@@ -207,6 +281,22 @@ def refine_by_radial_gradient(
     r_hi = int(r_s + search_half)
     radii = np.arange(r_lo, r_hi + 1)
 
+    if step_writer is not None:
+        step_writer.add(
+            4, 1, f"stage4_blurred{step_tag}", blurred,
+            f"Stage 4.1{step_tag} — blurred (σ={blur_sigma})",
+            "Fringe texture suppressed; edge step preserved",
+        )
+        vis = _to_bgr_u8(blurred)
+        cv2.circle(vis, (int(cx_s), int(cy_s)), int(r_s), (0, 255, 0), 2)
+        cv2.circle(vis, (int(cx_s), int(cy_s)), r_lo, (255, 255, 0), 1)
+        cv2.circle(vis, (int(cx_s), int(cy_s)), r_hi, (255, 255, 0), 1)
+        step_writer.add(
+            4, 2, f"stage4_search{step_tag}", vis,
+            f"Stage 4.2{step_tag} — radial search band",
+            f"initial r={r_s:.1f}, search ±{search_half} px",
+        )
+
     edge_pts: list[tuple[float, float]] = []
     for ca, sa in zip(cos_a, sin_a):
         xs = np.clip((cx_s + radii * ca).astype(int), 0, sw - 1)
@@ -217,12 +307,40 @@ def refine_by_radial_gradient(
             edge_r = radii[best_i]
             edge_pts.append((cx_s + edge_r * ca, cy_s + edge_r * sa))
 
+    if step_writer is not None:
+        vis = _to_bgr_u8(blurred)
+        for ex, ey in edge_pts:
+            cv2.circle(vis, (int(round(ex)), int(round(ey))), 1, (0, 0, 255), -1)
+        step_writer.add(
+            4, 3, f"stage4_edge_points{step_tag}", vis,
+            f"Stage 4.3{step_tag} — accepted edge points",
+            f"{len(edge_pts)} of {n_angles} angles accepted",
+        )
+
     if len(edge_pts) < 20:
         return cx_s, cy_s, r_s  # not enough edges — keep original estimate
 
     pts = np.array(edge_pts)
     step = max(1, len(pts) // 400)
     model = ransac_circle(pts[::step], residual_threshold=3.0)
+
+    if step_writer is not None:
+        vis = _to_bgr_u8(blurred)
+        if model is not None:
+            cv2.circle(
+                vis,
+                (int(round(model[0])), int(round(model[1]))),
+                int(round(model[2])),
+                (0, 255, 0), 2,
+            )
+        else:
+            cv2.circle(vis, (int(cx_s), int(cy_s)), int(r_s), (0, 0, 255), 2)
+        step_writer.add(
+            4, 4, f"stage4_refined{step_tag}", vis,
+            f"Stage 4.4{step_tag} — refined circle",
+            f"r={model[2]:.2f} px" if model is not None else "RANSAC failed — kept original estimate",
+        )
+
     if model is None:
         return cx_s, cy_s, r_s
     return model
@@ -242,6 +360,7 @@ def detect_spots(
     prev_spots: Optional[list] = None,
     blur_sigma: float = 6.0,
     rim_frac: float = 0.07,
+    step_writer: Optional[StepWriter] = None,
 ) -> list:
     """
     Find bright internal-reflection spots inside the mirror aperture.
@@ -273,6 +392,12 @@ def detect_spots(
     """
     h, w = small.shape
     lp = cv2.GaussianBlur(small.astype(np.float32), (0, 0), blur_sigma)
+    if step_writer is not None:
+        step_writer.add(
+            5, 1, "stage5_lp", lp,
+            "Stage 5.1 — fringe-suppressed image (σ=6)",
+            "Fringes blurred away; compact glows remain",
+        )
 
     # Smooth background: morphological opening with a kernel larger than any
     # spot removes the spots but follows the mirror's broad brightness field.
@@ -288,6 +413,17 @@ def detect_spots(
     )
     bg = cv2.resize(bg_ds, (w, h), interpolation=cv2.INTER_LINEAR)
     tophat = lp - bg
+    if step_writer is not None:
+        step_writer.add(
+            5, 2, "stage5_background", bg,
+            "Stage 5.2 — smooth background estimate",
+            f"morphological opening, kernel≈{ksz} px",
+        )
+        step_writer.add(
+            5, 3, "stage5_tophat", tophat,
+            "Stage 5.3 — top-hat (lp − bg)",
+            "Positive = brighter than local background",
+        )
 
     # Search only inside the mirror, minus a thin rim.
     yy, xx = np.ogrid[:h, :w]
@@ -295,6 +431,12 @@ def detect_spots(
     mirror = (xx - cx_s) ** 2 + (yy - cy_s) ** 2 <= search_r ** 2
 
     hot = (tophat > threshold * bg) & mirror
+    if step_writer is not None:
+        step_writer.add(
+            5, 4, "stage5_hot", hot.astype(np.uint8) * 255,
+            "Stage 5.4 — thresholded hot mask",
+            f"tophat > {threshold:g} × bg, inside mirror",
+        )
 
     # Hysteresis: relax the threshold near spots seen in the previous frame.
     if prev_spots:
@@ -316,6 +458,12 @@ def detect_spots(
             )
             relaxed = (tophat > _SPOT_PREV_RELAX * threshold * bg) & mirror
             hot = hot | (relaxed & (prev_mask > 0))
+    if step_writer is not None and prev_spots:
+        step_writer.add(
+            5, 5, "stage5_hot_with_prev", hot.astype(np.uint8) * 255,
+            "Stage 5.5 — hot mask + previous-frame hysteresis",
+            f"threshold relaxed to {_SPOT_PREV_RELAX:g}× near previous spots",
+        )
 
     hot_u8 = hot.astype(np.uint8)
     # Close small gaps, then dilate slightly so the polygon generously covers
@@ -327,6 +475,12 @@ def detect_spots(
     hot_u8 = cv2.dilate(
         hot_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     )
+    if step_writer is not None:
+        step_writer.add(
+            5, 6, "stage5_morph", hot_u8,
+            "Stage 5.6 — close 5×5 + dilate 5×5",
+            "Grows each blob so it generously covers the spot's halo",
+        )
 
     # Reject blobs larger than a plausible reflection (low-tilt undulations).
     max_area = np.pi * (_SPOT_MAX_RADIUS_FRAC * r_s) ** 2
@@ -351,10 +505,46 @@ def detect_spots(
         if len(poly) >= 3:
             regions.append(poly)
 
+    if step_writer is not None:
+        vis = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+        cv2.circle(vis, (int(round(cx_s)), int(round(cy_s))), int(round(r_s)),
+                   (0, 255, 0), 2)
+        for poly in regions:
+            pts = np.array([[p["x"] / scale, p["y"] / scale] for p in poly],
+                           dtype=np.float32)
+            if len(pts) >= 2:
+                cv2.polylines(vis, [pts.astype(np.int32)], True, (0, 255, 0), 2)
+        step_writer.add(
+            5, 7, "stage5_components", vis,
+            "Stage 5.7 — candidate blobs after area filtering",
+            f"{len(regions)} candidate(s)",
+        )
+
     # A frame with too many candidates is a low-tilt fringe storm, not a set of
     # real reflections — reject them all.
     if len(regions) > _SPOT_MAX_COUNT:
+        if step_writer is not None:
+            step_writer.add(
+                5, 8, "stage5_spots_rejected", vis,
+                "Stage 5.8 — swarm rejection",
+                f"{len(regions)} candidates > {_SPOT_MAX_COUNT} → all rejected",
+            )
         return []
+
+    if step_writer is not None:
+        vis = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+        cv2.circle(vis, (int(round(cx_s)), int(round(cy_s))), int(round(r_s)),
+                   (0, 255, 0), 2)
+        for poly in regions:
+            pts = np.array([[p["x"] / scale, p["y"] / scale] for p in poly],
+                           dtype=np.float32)
+            if len(pts) >= 2:
+                cv2.polylines(vis, [pts.astype(np.int32)], True, (0, 0, 255), 2)
+        step_writer.add(
+            5, 8, "stage5_spots_final", vis,
+            "Stage 5.8 — final spot polygons",
+            f"{len(regions)} accepted spot(s)",
+        )
 
     return regions
 
@@ -372,6 +562,7 @@ def detect_mirror(
     find_spots: bool = True,
     spot_threshold: float = SPOT_THRESHOLD,
     prev_spots: Optional[list] = None,
+    step_writer: Optional[StepWriter] = None,
 ) -> Optional[tuple[float, float, float, float, list]]:
     """
     Detect the mirror aperture circle in an interferogram image.
@@ -390,6 +581,10 @@ def detect_mirror(
     (low-fringe) image that is not suitable for DFTFringe processing.  regions
     is a list of bright internal-reflection spot polygons (empty when
     find_spots is False or none are found); see detect_spots.
+
+    If `step_writer` is provided, labelled intermediate step images are saved
+    during detection.  Because this function can return early, the caller is
+    responsible for calling ``step_writer.save_manifest()`` afterwards.
     """
     img_bgr = cv2.imread(str(image_path))
     if img_bgr is None:
@@ -401,14 +596,34 @@ def detect_mirror(
     small_w, small_h = w // scale, h // scale
     small = cv2.resize(img_gray, (small_w, small_h), interpolation=cv2.INTER_AREA)
 
+    sw = step_writer
+    if sw is not None:
+        sw.add(0, 0, "input_small", small,
+               "Input — grayscale at detection scale",
+               f"{small_w}×{small_h}, scale={scale}")
+
     # ------------------------------------------------------------------
     # Stage 1: outer illumination envelope
     # ------------------------------------------------------------------
     _, binary = cv2.threshold(small, threshold, 255, cv2.THRESH_BINARY)
+    if sw is not None:
+        sw.add(1, 1, "stage1_threshold", binary,
+               "Stage 1.1 — brightness threshold",
+               f"threshold={threshold}, brighter pixels become 255")
+
     kernel_c = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_c)
+    if sw is not None:
+        sw.add(1, 2, "stage1_close", binary,
+               "Stage 1.2 — morphological close 7×7",
+               "Bridges dark fringe bands in the envelope")
+
     kernel_o = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_o)
+    if sw is not None:
+        sw.add(1, 3, "stage1_open", binary,
+               "Stage 1.3 — morphological open 3×3",
+               "Removes isolated pixel noise")
 
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
@@ -427,12 +642,26 @@ def detect_mirror(
     # Estimate the envelope radius for the outer-ring fallback below.
     _, r_env_s = cv2.minEnclosingCircle(largest_env)
 
+    if sw is not None:
+        vis = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+        cv2.drawContours(vis, [largest_env], -1, (0, 255, 0), 2)
+        sw.add(1, 4, "stage1_envelope_contour", vis,
+               "Stage 1.4 — largest contour (outer envelope)",
+               f"area={cv2.contourArea(largest_env):.0f} px²")
+        sw.add(1, 5, "stage1_envelope_mask", envelope_mask,
+               "Stage 1.5 — filled envelope mask",
+               "Bounds the search for later stages")
+
     # ------------------------------------------------------------------
     # Stage 2: local variance mask (fringe region)
     # ------------------------------------------------------------------
     sf = small.astype(np.float32)
     mean_f = uniform_filter(sf, 21)
     var_map = np.clip(uniform_filter(sf ** 2, 21) - mean_f ** 2, 0, None)
+    if sw is not None:
+        sw.add(2, 0, "stage2_var_raw", var_map,
+               "Stage 2.0 — local variance map (21×21)",
+               "High variance = fringe texture")
 
     # Fringe visibility score: normalised high-spatial-frequency variance
     # inside the envelope.  A 5×5 filter captures fringe texture (higher
@@ -444,40 +673,116 @@ def detect_mirror(
     _env_mean = float(_env_pixels.mean()) + 1e-6
     fringe_score = float(np.sqrt(_var5[envelope_mask > 0]).mean()) / _env_mean
 
-    def _fringe_ransac(mask: np.ndarray) -> Optional[tuple[float, float, float]]:
+    def _fringe_ransac(
+        mask: np.ndarray,
+        tag: str = "",
+    ) -> Optional[tuple[float, float, float]]:
         """
         Run Stage 2 (variance mask) + Stage 3 (RANSAC) with the given mask.
         Returns (cx_s, cy_s, r_s) in small-scale pixels, or None.
+
+        `tag` distinguishes the outer-ring fallback attempt from the first
+        attempt in the saved step-image filenames and titles.
         """
         var_in = var_map.copy()
         var_in[mask == 0] = 0.0
+        if sw is not None:
+            sw.add(
+                2, 1, f"stage2_var_in{tag}", var_in,
+                f"Stage 2.1{tag} — variance zeroed outside mask",
+                "Ignores high-variance artefacts outside the mask",
+            )
 
         var_sqrt = np.sqrt(var_in)
+        if sw is not None:
+            sw.add(
+                2, 2, f"stage2_var_sqrt{tag}", var_sqrt,
+                f"Stage 2.2{tag} — sqrt(variance)",
+                "Square root linearises the distribution for Otsu",
+            )
+
         v_max = var_sqrt.max()
         if v_max < 1e-6:
             return None
         v_u8 = np.clip(var_sqrt / v_max * 255, 0, 255).astype(np.uint8)
+        if sw is not None:
+            sw.add(
+                2, 3, f"stage2_var_u8{tag}", v_u8,
+                f"Stage 2.3{tag} — variance normalised to 8-bit",
+                "Visualisation of the Otsu input",
+            )
+
         otsu_val, _ = cv2.threshold(v_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         vt = (otsu_val / 255.0 * v_max) ** 2
 
         vbin = (var_in > vt).astype(np.uint8) * 255
+        if sw is not None:
+            sw.add(
+                2, 4, f"stage2_vbin{tag}", vbin,
+                f"Stage 2.4{tag} — Otsu threshold",
+                f"variance threshold={vt:.1f}",
+            )
+
         vbin = cv2.morphologyEx(
             vbin, cv2.MORPH_CLOSE,
             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
         )
+        if sw is not None:
+            sw.add(
+                2, 5, f"stage2_close{tag}", vbin,
+                f"Stage 2.5{tag} — close 15×15",
+                "Fills dark fringe holes in the variance mask",
+            )
+
         vbin = cv2.morphologyEx(
             vbin, cv2.MORPH_OPEN,
             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         )
+        if sw is not None:
+            sw.add(
+                2, 6, f"stage2_open{tag}", vbin,
+                f"Stage 2.6{tag} — open 5×5",
+                "Removes small islands",
+            )
+
         conts, _ = cv2.findContours(vbin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         if not conts:
             return None
         fc = max(conts, key=cv2.contourArea)
+        if sw is not None:
+            vis = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+            cv2.drawContours(vis, [fc], -1, (255, 0, 0), 2)
+            sw.add(
+                3, 1, f"stage3_contour{tag}", vis,
+                f"Stage 3.1{tag} — fringe contour",
+                "Largest contour in the variance mask",
+            )
+
         pts_fc = fc.squeeze(axis=1).astype(float)
         if len(pts_fc) < 20:
             return None
         step = max(1, len(pts_fc) // 400)
-        return ransac_circle(pts_fc[::step], residual_threshold=5.0, max_trials=1000)
+        model = ransac_circle(pts_fc[::step], residual_threshold=5.0, max_trials=1000)
+
+        if sw is not None and model is not None:
+            cx_m, cy_m, r_m = model
+            vis = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+            cv2.drawContours(vis, [fc], -1, (255, 0, 0), 1)
+            cv2.circle(vis, (int(round(cx_m)), int(round(cy_m))), int(round(r_m)),
+                       (0, 0, 255), 2)
+            dists = np.abs(np.hypot(pts_fc[:, 0] - cx_m, pts_fc[:, 1] - cy_m) - r_m)
+            inliers = pts_fc[dists < 5.0]
+            stride = max(1, len(inliers) // 2000)
+            for pt in inliers[::stride]:
+                cv2.circle(vis, (int(round(pt[0])), int(round(pt[1]))), 1,
+                           (0, 255, 0), -1)
+            sw.add(
+                3, 2, f"stage3_ransac{tag}", vis,
+                f"Stage 3.2{tag} — RANSAC circle + inliers",
+                f"r={r_m:.1f} small-scale px, inliers={len(inliers)}",
+            )
+
+        return model
 
     # ------------------------------------------------------------------
     # Stage 2+3: first pass with the full envelope mask
@@ -505,7 +810,13 @@ def detect_mirror(
             cv2.MORPH_ELLIPSE, (2 * erode_r + 1, 2 * erode_r + 1)
         )
         inner_mask = cv2.erode(envelope_mask, erode_k)
-        retry = _fringe_ransac(inner_mask)
+        if sw is not None:
+            sw.add(
+                2, 0, "fallback_inner_mask", inner_mask,
+                "Outer-ring fallback — eroded envelope mask",
+                f"eroded by {erode_r} px to exclude the envelope boundary ring",
+            )
+        retry = _fringe_ransac(inner_mask, tag="_retry")
         if retry is not None and retry[2] < r_env_s * 0.90:
             print(
                 f"\n    outer-ring latch detected (r={r_s*scale:.0f} px ≈ r_env={r_env_s*scale:.0f} px)"
@@ -520,7 +831,9 @@ def detect_mirror(
     # gradient at each angle.  Converts the ~10 px radius over-estimate from
     # the variance contour into sub-pixel accuracy.
     # ------------------------------------------------------------------
-    cx_s, cy_s, r_s = refine_by_radial_gradient(small, cx_s, cy_s, r_s)
+    cx_s, cy_s, r_s = refine_by_radial_gradient(
+        small, cx_s, cy_s, r_s, step_writer=sw
+    )
 
     # ------------------------------------------------------------------
     # Fallback: if we have a previous frame's circle and the radius has
@@ -540,7 +853,10 @@ def detect_mirror(
             )
             prev_cx_s = prev_circle[0] / scale
             prev_cy_s = prev_circle[1] / scale
-            fallback = refine_by_radial_gradient(small, prev_cx_s, prev_cy_s, prev_r_s)
+            fallback = refine_by_radial_gradient(
+                small, prev_cx_s, prev_cy_s, prev_r_s,
+                step_writer=sw, step_tag="_fallback",
+            )
             # Accept the fallback only if it converged to a plausible radius
             if abs(fallback[2] - prev_r_s) < prev_r_s * 0.10:
                 cx_s, cy_s, r_s = fallback
@@ -571,7 +887,22 @@ def detect_mirror(
         regions = detect_spots(
             small, cx_s, cy_s, r_s,
             scale=scale, threshold=spot_threshold, prev_spots=prev_spots,
+            step_writer=sw,
         )
+
+    if sw is not None:
+        vis = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+        cv2.circle(vis, (int(round(cx_s)), int(round(cy_s))), int(round(r_s)),
+                   (0, 255, 0), 2)
+        for poly in regions:
+            pts = np.array([[p["x"] / scale, p["y"] / scale] for p in poly],
+                           dtype=np.float32)
+            if len(pts) >= 2:
+                cv2.polylines(vis, [pts.astype(np.int32)], True, (0, 0, 255), 2)
+        sw.add(6, 1, "final_result", vis,
+               "Final result (detection scale)",
+               f"cx={cx:.1f} cy={cy:.1f} r={radius:.1f} full-res px, "
+               f"fringe={fringe_score:.2f}, spots={len(regions)}")
 
     return cx, cy, radius, fringe_score, regions
 
@@ -747,12 +1078,16 @@ def process_directory(
     re_look: bool = False,
     find_spots: bool = True,
     spot_threshold: float = SPOT_THRESHOLD,
+    save_steps: bool = False,
 ) -> None:
     """
     Process all JPEG images in `directory`.
 
     --compare mode: only process images that already have a .oln, and print
     detected values alongside existing values for accuracy checking.
+
+    If `save_steps` is True, labelled intermediate step images are written to
+    ``<directory>/steps/<image_stem>/`` for later visual inspection.
     """
     images = sorted(
         p for p in directory.iterdir()
@@ -772,6 +1107,9 @@ def process_directory(
     else:
         print(f"Found {len(images)} image(s) in {directory}")
 
+    if save_steps:
+        print(f"Saving step images to {directory / 'steps' / '<image_stem>'}/")
+
     prev_circle: Optional[tuple[float, float, float]] = None
     prev_spots: list = []
     processed = skipped = failed = 0
@@ -780,8 +1118,9 @@ def process_directory(
 
     for img_path in images:
         oln_path = img_path.with_suffix(".oln")
+        had_oln = oln_path.exists()
 
-        if oln_path.exists() and not force and not compare:
+        if had_oln and not force and not compare and not save_steps:
             existing = load_oln_circle(oln_path)
             if existing:
                 prev_circle = existing
@@ -792,6 +1131,11 @@ def process_directory(
 
         print(f"  {img_path.name}: detecting...", end="", flush=True)
 
+        step_writer = None
+        if save_steps:
+            steps_dir = directory / "steps" / img_path.stem
+            step_writer = StepWriter(steps_dir)
+
         result = detect_mirror(
             img_path,
             scale=scale,
@@ -801,7 +1145,11 @@ def process_directory(
             find_spots=find_spots,
             spot_threshold=spot_threshold,
             prev_spots=prev_spots,
+            step_writer=step_writer,
         )
+
+        if step_writer is not None:
+            step_writer.save_manifest()
 
         if result is None:
             print(" FAILED")
@@ -832,15 +1180,19 @@ def process_directory(
             processed += 1
             continue
 
-        tag = " [dry-run]" if dry_run else ""
+        steps_only = save_steps and had_oln and not force
+        tag = " [dry-run]" if dry_run else (" [steps-only]" if steps_only else "")
         print(f" cx={cx:.1f} cy={cy:.1f} r={radius:.1f}  fringe={fringe_score:.2f}{fringe_tag}{spot_tag}{tag}")
 
-        if not dry_run:
+        if not dry_run and (force or not had_oln):
             write_oln(oln_path, cx, cy, radius, regions)
 
         prev_circle = (cx, cy, radius)
         prev_spots = regions
-        all_results.append((img_path, cx, cy, radius, fringe_score, regions))
+        # A save-steps-only run on an image that already has an .oln should
+        # regenerate the step images but leave the existing .oln alone.
+        if not steps_only:
+            all_results.append((img_path, cx, cy, radius, fringe_score, regions))
         processed += 1
 
     if re_look and all_results:
@@ -933,6 +1285,14 @@ def main() -> None:
             f"bright spot (default: {SPOT_THRESHOLD}; lower = more sensitive)"
         ),
     )
+    parser.add_argument(
+        "--save-steps",
+        action="store_true",
+        help=(
+            "Save labelled intermediate step images for each processed image "
+            "(written to <directory>/steps/<image_stem>/ for visual inspection)"
+        ),
+    )
     args = parser.parse_args()
 
     directory = Path(args.directory)
@@ -951,6 +1311,7 @@ def main() -> None:
         re_look=args.re_look,
         find_spots=not args.no_spots,
         spot_threshold=args.spot_threshold,
+        save_steps=args.save_steps,
     )
 
 

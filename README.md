@@ -117,6 +117,15 @@ start or cancel a run.  The right panel lists every image with a status symbol
 (`[✓]` ok, `[~]` low-fringe, `[!]` failed, `[S]` skipped) — click any entry
 to see a cropped preview of the detected circle. Double click to de-select it.
 
+If you enable **`--save-steps`**, each processed image also writes labelled
+intermediate step images (at detection scale) to `steps/<image_stem>/` inside
+its directory, plus a `manifest.json` that lists them in order.  After
+the run, select an image and use the step browser under the preview: the
+**`◀` / `▶`** buttons or the **`←` / `→`** arrow keys step through every saved
+image (`Home`/`End` jump to the first/last step, `R` returns to the normal
+result preview).  The dropdown lists every step by name, and the note line
+explains what each image shows.
+
 ---
 
 ## Usage
@@ -144,6 +153,7 @@ Common options:
 | `--jump-warn N` |   50    | Warn if circle centre moves > N px between frames |
 | `--no-spots`    |   off   | Disable bright internal-reflection spot detection (on by default) |
 | `--spot-threshold F` | 0.35 | Brightness excess over local background to flag a spot (lower = more sensitive) |
+| `--save-steps`  |   off   | Save labelled intermediate step images to `<directory>/steps/<image_stem>/` for inspection |
 
 Example:
 

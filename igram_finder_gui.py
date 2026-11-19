@@ -10,7 +10,10 @@ Layout
 Left panel  : directory list, detection options, Run/Cancel, scrolling log.
 Right panel : image list (top) + zoomed circle preview (bottom).
               Click any image in the list to view it; the preview shows the
-              circle region cropped with a 10 % margin on every side.
+              circle region cropped with a 10 % margin on every side.  When
+              --save-steps has generated step images, the controls under the
+              preview (◀ ▶, dropdown, and the ← → Home End R keys) step
+              through every intermediate image.
 """
 
 import io
@@ -30,6 +33,7 @@ from PIL import Image, ImageTk
 from igram_finder import (
     LOW_FRINGE_SCORE,
     SPOT_THRESHOLD,
+    StepWriter,
     _second_pass,
     detect_mirror,
     load_oln_circle,
@@ -215,10 +219,28 @@ class IgramFinderGUI:
         self._run_included: set[str] = set()   # snapshot of paths to process
 
         # preview cache — avoid re-reading the JPEG on every canvas resize
-        self._crop_bgr: Optional[np.ndarray] = None   # BGR crop with circle drawn
+        self._crop_bgr: Optional[np.ndarray] = None   # image currently shown
+        self._result_bgr: Optional[np.ndarray] = None  # normal result preview
         self._current_img_path: Optional[Path] = None
 
+        # saved-step inspection state
+        self._steps_dir: Optional[Path] = None
+        self._steps: list[dict] = []
+        self._current_step_index: Optional[int] = None  # None = result view
+        self._in_step_update = False  # guards against combo event recursion
+        self._preview_title_var = tk.StringVar(
+            value="Preview  (circle region ± 10 % margin):")
+        self._step_note_var = tk.StringVar(value="")
+
         self._build_ui()
+
+        # Global keys for fast step switching.  The handlers return None
+        # (i.e. don't swallow the key) when no step images are loaded.
+        self.root.bind_all("<Key-Left>", self._step_prev)
+        self.root.bind_all("<Key-Right>", self._step_next)
+        self.root.bind_all("<Key-Home>", self._step_first)
+        self.root.bind_all("<Key-End>", self._step_last)
+        self.root.bind_all("<Key-r>", self._show_result)
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -282,6 +304,7 @@ class IgramFinderGUI:
         self._compare_var = tk.BooleanVar()
         self._relook_var  = tk.BooleanVar()
         self._nospots_var = tk.BooleanVar()
+        self._savesteps_var = tk.BooleanVar()
 
         for text, var in [
             ("--force  (overwrite existing .oln)", self._force_var),
@@ -289,6 +312,7 @@ class IgramFinderGUI:
             ("--compare  (test vs existing .oln)", self._compare_var),
             ("--re-look  (second-pass consensus)", self._relook_var),
             ("--no-spots  (disable reflection detection)", self._nospots_var),
+            ("--save-steps  (save step images for inspection)", self._savesteps_var),
         ]:
             ttk.Checkbutton(parent, text=text, variable=var).grid(
                 row=row, column=0, sticky="w"); row += 1
@@ -381,19 +405,43 @@ class IgramFinderGUI:
                   font=("Courier", 9), anchor="w").grid(
             row=3, column=0, columnspan=2, sticky="ew", pady=(2, 0))
 
-        # bottom: preview canvas
+        # bottom: preview canvas + saved-step inspection controls
         bot = ttk.Frame(paned, padding=(4, 4))
         bot.columnconfigure(0, weight=1)
         bot.rowconfigure(1, weight=1)
         paned.add(bot, minsize=300)
 
-        ttk.Label(bot, text="Preview  (circle region ± 10 % margin):").grid(
+        ttk.Label(bot, textvariable=self._preview_title_var).grid(
             row=0, column=0, sticky="w")
 
         self._canvas = tk.Canvas(bot, bg="#1a1a1a", highlightthickness=0)
         self._canvas.grid(row=1, column=0, sticky="nsew")
         self._canvas.bind("<Configure>", self._on_canvas_resize)
         self._photo_ref: Optional[ImageTk.PhotoImage] = None  # prevent GC
+
+        # Step browser: ◀ ▶ buttons + a dropdown listing every saved step.
+        step_bar = ttk.Frame(bot)
+        step_bar.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        step_bar.columnconfigure(1, weight=1)
+
+        self._step_prev_btn = ttk.Button(step_bar, text="◀", width=3,
+                                         command=self._step_prev,
+                                         state=tk.DISABLED)
+        self._step_prev_btn.grid(row=0, column=0)
+
+        self._step_combo = ttk.Combobox(step_bar, state="disabled",
+                                        width=70, height=12)
+        self._step_combo.grid(row=0, column=1, sticky="ew", padx=4)
+        self._step_combo.bind("<<ComboboxSelected>>", self._on_step_combo)
+
+        self._step_next_btn = ttk.Button(step_bar, text="▶", width=3,
+                                         command=self._step_next,
+                                         state=tk.DISABLED)
+        self._step_next_btn.grid(row=0, column=2)
+
+        ttk.Label(bot, textvariable=self._step_note_var,
+                  font=("Courier", 9), anchor="w").grid(
+            row=3, column=0, sticky="ew", pady=(2, 0))
 
     # ── directory management ──────────────────────────────────────────────────
 
@@ -580,6 +628,7 @@ class IgramFinderGUI:
         compare    = self._compare_var.get()
         re_look    = self._relook_var.get()
         find_spots = not self._nospots_var.get()
+        save_steps = self._savesteps_var.get()
         scale      = self._scale_var.get()
         threshold  = self._threshold_var.get()
         jump_warn  = self._jumpwarn_var.get()
@@ -595,6 +644,9 @@ class IgramFinderGUI:
                     break
 
                 self._work_queue.put(("log", f"\n─── {directory} ───"))
+                if save_steps:
+                    self._work_queue.put(
+                        ("log", f"Saving step images to {directory / 'steps' / '<image_stem>'}/"))
                 images = [p for p in self._image_paths
                           if p.parent == directory
                           and str(p) in self._run_included]
@@ -612,9 +664,10 @@ class IgramFinderGUI:
 
                     self._work_queue.put(("status", (img_path, "running")))
                     oln_path = img_path.with_suffix(".oln")
+                    had_oln = oln_path.exists()
 
-                    # skip if .oln exists and not force/compare
-                    if oln_path.exists() and not force and not compare:
+                    # skip if .oln exists and not force/compare/save-steps
+                    if had_oln and not force and not compare and not save_steps:
                         existing = load_oln_circle(oln_path)
                         prev_spots = load_oln_regions(oln_path)
                         if existing:
@@ -628,6 +681,12 @@ class IgramFinderGUI:
                         continue
 
                     print(f"  {img_path.name}: detecting…", end="", flush=True)
+
+                    step_writer = None
+                    if save_steps:
+                        steps_dir = img_path.parent / "steps" / img_path.stem
+                        step_writer = StepWriter(steps_dir)
+
                     result = detect_mirror(
                         img_path,
                         scale=scale,
@@ -637,7 +696,11 @@ class IgramFinderGUI:
                         find_spots=find_spots,
                         spot_threshold=spot_thresh,
                         prev_spots=prev_spots,
+                        step_writer=step_writer,
                     )
+
+                    if step_writer is not None:
+                        step_writer.save_manifest()
 
                     if result is None:
                         print(" FAILED")
@@ -648,19 +711,23 @@ class IgramFinderGUI:
                     status = "low-fringe" if fringe_score < LOW_FRINGE_SCORE else "ok"
                     fringe_tag = " [low-fringe]" if status == "low-fringe" else ""
                     spot_tag = f" [{len(regions)} spot(s)]" if regions else ""
-                    tag = " [dry-run]" if dry_run else ""
+                    steps_only = save_steps and had_oln and not force
+                    tag = " [dry-run]" if dry_run else (" [steps-only]" if steps_only else "")
                     print(
                         f" cx={cx:.1f} cy={cy:.1f} r={radius:.1f}"
                         f"  fringe={fringe_score:.2f}{fringe_tag}{spot_tag}{tag}"
                     )
 
-                    if not dry_run and not compare:
+                    if not dry_run and not compare and (force or not had_oln):
                         write_oln(oln_path, cx, cy, radius, regions)
 
                     prev_circle = (cx, cy, radius)
                     prev_spots = regions
-                    all_results.append(
-                        (img_path, cx, cy, radius, fringe_score, regions))
+                    # A save-steps-only run on an image that already has an
+                    # .oln should regenerate step images but not the .oln.
+                    if not steps_only:
+                        all_results.append(
+                            (img_path, cx, cy, radius, fringe_score, regions))
                     self._work_queue.put(
                         ("result", (img_path, cx, cy, radius, fringe_score, regions, status)))
 
@@ -738,7 +805,8 @@ class IgramFinderGUI:
             self._img_status_var.set(info.get("status", "pending"))
 
     def _load_and_render(self, img_path: Path) -> None:
-        """Load the image (and circle if available), cache the crop, display."""
+        """Load the image (and circle if available), cache the result preview,
+        load any saved step images, and display the result view."""
         self._current_img_path = img_path
 
         img_bgr = cv2.imread(str(img_path))
@@ -753,16 +821,157 @@ class IgramFinderGUI:
         regions = info.get("regions")
 
         if cx is not None and cy is not None and radius is not None:
-            self._crop_bgr = self._make_crop(img_bgr, cx, cy, radius, regions)
+            self._result_bgr = self._make_crop(img_bgr, cx, cy, radius, regions)
         else:
             # No detection yet — show the full image thumbnail
             h, w = img_bgr.shape[:2]
             thumb_w = min(w, 1200)
             thumb_h = int(h * thumb_w / w)
-            self._crop_bgr = cv2.resize(
+            self._result_bgr = cv2.resize(
                 img_bgr, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
 
-        self._render_crop()
+        self._load_steps_for(img_path)
+        self._show_step(None)   # start on the normal result view
+
+    # ── saved-step inspection ────────────────────────────────────────────────
+
+    def _load_steps_for(self, img_path: Path) -> None:
+        """Read the step manifest for `img_path` (if any) and populate the
+        step dropdown.  Images themselves are loaded lazily when selected."""
+        self._steps_dir = img_path.parent / "steps" / img_path.stem
+        self._steps = []
+        self._current_step_index = None
+
+        manifest_path = self._steps_dir / "manifest.json"
+        if manifest_path.exists():
+            try:
+                data = json.loads(manifest_path.read_text())
+                steps = data.get("steps", [])
+                self._steps = steps if isinstance(steps, list) else []
+            except (OSError, ValueError, json.JSONDecodeError):
+                self._steps = []
+
+        values = ["Result (normal preview)"]
+        for idx, s in enumerate(self._steps, 1):
+            title = s.get("title") or s.get("name") or s.get("file", "")
+            values.append(f"{s.get('seq', idx)}: {title}")
+
+        self._step_combo.config(values=values, state="readonly")
+        self._step_combo.current(0)
+
+        has_steps = bool(self._steps)
+        self._step_prev_btn.config(state=tk.NORMAL if has_steps else tk.DISABLED)
+        self._step_next_btn.config(state=tk.NORMAL if has_steps else tk.DISABLED)
+        if not has_steps:
+            self._step_combo.config(state=tk.DISABLED)
+            self._preview_title_var.set("Preview  (circle region ± 10 % margin):")
+            self._step_note_var.set("No saved steps — run with --save-steps to create them.")
+
+    def _show_step(self, index: Optional[int]) -> None:
+        """Display a saved step image, or the result view when `index` is None."""
+        if self._in_step_update:
+            return
+        self._in_step_update = True
+        try:
+            if index is None:
+                self._current_step_index = None
+                self._crop_bgr = self._result_bgr
+                self._step_combo.current(0)
+                self._preview_title_var.set("Preview  (circle region ± 10 % margin):")
+                if self._steps:
+                    self._step_note_var.set(
+                        f"Result view — {len(self._steps)} saved step(s) available "
+                        "(◀ ▶ / ← → to switch)")
+                self._render_crop()
+                return
+
+            if not self._steps or self._steps_dir is None:
+                return
+
+            i = max(0, min(len(self._steps) - 1, index))
+            s = self._steps[i]
+            file = s.get("file")
+            if not file:
+                self._step_note_var.set("Step entry has no file name")
+                return
+            img = cv2.imread(str(self._steps_dir / file))
+            if img is None:
+                self._step_note_var.set(f"Could not read {file}")
+                return
+
+            self._current_step_index = i
+            self._crop_bgr = img
+            self._step_combo.current(i + 1)
+
+            title = s.get("title") or s.get("name") or file
+            note = s.get("note", "")
+            self._preview_title_var.set(f"Step {i + 1}/{len(self._steps)} — {title}")
+            self._step_note_var.set(note)
+            self._render_crop()
+        finally:
+            self._in_step_update = False
+
+    def _step_key_ok(self, event: Optional[tk.Event]) -> bool:
+        """True when a global step key should be handled."""
+        if event is None or event.widget is None:
+            return True
+        try:
+            # Only handle keys in the main window, not in modal dialogs.
+            if event.widget.winfo_toplevel() is not self.root:
+                return False
+        except tk.TclError:
+            return False
+        cls = event.widget.winfo_class()
+        return cls not in ("TEntry", "TSpinbox", "TCombobox")
+
+    def _step_prev(self, event: Optional[tk.Event] = None) -> Optional[str]:
+        if not self._steps or not self._step_key_ok(event):
+            return None
+        if self._current_step_index is None:
+            self._show_step(len(self._steps) - 1)
+        elif self._current_step_index > 0:
+            self._show_step(self._current_step_index - 1)
+        else:
+            self._show_step(None)
+        return "break"
+
+    def _step_next(self, event: Optional[tk.Event] = None) -> Optional[str]:
+        if not self._steps or not self._step_key_ok(event):
+            return None
+        if self._current_step_index is None:
+            self._show_step(0)
+        elif self._current_step_index + 1 < len(self._steps):
+            self._show_step(self._current_step_index + 1)
+        else:
+            self._show_step(None)
+        return "break"
+
+    def _step_first(self, event: Optional[tk.Event] = None) -> Optional[str]:
+        if not self._steps or not self._step_key_ok(event):
+            return None
+        self._show_step(0)
+        return "break"
+
+    def _step_last(self, event: Optional[tk.Event] = None) -> Optional[str]:
+        if not self._steps or not self._step_key_ok(event):
+            return None
+        self._show_step(len(self._steps) - 1)
+        return "break"
+
+    def _show_result(self, event: Optional[tk.Event] = None) -> Optional[str]:
+        if not self._steps or not self._step_key_ok(event):
+            return None
+        self._show_step(None)
+        return "break"
+
+    def _on_step_combo(self, _event: Optional[tk.Event] = None) -> None:
+        if self._in_step_update or not self._steps:
+            return
+        idx = self._step_combo.current()
+        if idx <= 0:
+            self._show_step(None)
+        else:
+            self._show_step(idx - 1)
 
     @staticmethod
     def _make_crop(img_bgr: np.ndarray,
